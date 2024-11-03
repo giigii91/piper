@@ -58,7 +58,7 @@ class VitsModel(pl.LightningModule):
         segment_size: int = 8192,
         # training
         dataset: Optional[List[Union[str, Path]]] = None,
-        learning_rate: float = 1e-5,
+        learning_rate: float = 1e-2,
         betas: Tuple[float, float] = (0.8, 0.99),
         eps: float = 1e-9,
         batch_size: int = 1,
