@@ -1,40 +1,42 @@
 // ============================================================================
-//  DEMO: sistem care INVATA concepte, definitii, reguli, scopuri si face
-//  inferenta multi-pas pe graf — fara categorii semantice hardcodate si fara
-//  roluri adnotate manual.
+//  DEMO: sistem neuro-simbolic care INVATA PRIN CITIRE (ca un LLM care digera
+//  text), construieste o GEOMETRIE de graf si GENEREAZA prin "Next-Token pe
+//  graf" — traversare ghidata de vectorul de context al transformerului.
 // ----------------------------------------------------------------------------
 //  PRINCIPII (cerute explicit de audit):
-//   - ZERO if(word=="este"), zero "person/profession/location" in cod.
-//   - ZERO schema de roluri adnotata manual: NU mai exista "role_0/role_1/rel"
-//     scrise langa fiecare propozitie. Sistemul primeste DOAR text brut.
-//       * Care token este RELATIE se DESCOPERA distributional: un token care
-//         apare predominant in pozitie de mijloc, legand perechi distincte de
-//         capete, este o relatie (un "conector"). Restul sunt capete.
-//       * Sursa / tinta / corp-de-definitie ies din POZITIE + ARITATE fata de
-//         relatia descoperita. Nimic nu e numit in cod.
-//   - Conceptele apar prin CLUSTERING/recurenta: tinta spre care converg multe
-//     surse pe aceeasi relatie devine concept (abstractie descoperita).
-//   - Relatiile primesc un MOD emergent (abstractie / lant-cauzal / scop /
-//     definitie) calculat din SEMNATURA lor in graf, nu dintr-un nume.
-//   - Se DESCOPERA reguli (mostenire de categorie) si se face FORWARD-CHAINING:
-//     muchii noi sunt DERIVATE si reutilizate (rationament multi-pas real).
-//   - Raspunde la "de ce" construind un LANT cauza->scop si il verbalizeaza
-//     din pattern-urile descoperite (cuvintele vin din date, nu din cod).
-//   - Are un PLANNER: cauta un drum (plan) de la un nod la un scop.
-//   - Memoria lumii = GRAF (noduri+muchii), NU greutatile retelei.
-//   - Rationamentul = TRAVERSARE determinista => anti-halucinatie: daca nu
-//     exista drum, raspunsul e "Nu stiu".
-//   - Transformerul e DOAR encoder de embeddings (pattern/similaritate),
-//     nu baza de date a lumii.
-//
-//  Vocabular permis in cod: token, embedding, node, edge, cluster, memory,
-//  relation_id, concept_id, confidence, vector, graph, rule, mode, plan.
+//   - FARA TEXT BRUT IN COD: cunostintele NU sunt string-uri scrise in sursa.
+//     Motorul CITESTE un corpus extern (knowledge.txt / argv[1] / stdin),
+//     exact ca un om care citeste un manual, si il transforma in noduri+muchii.
+//     Codul nu contine propozitii-cunostinta si nici entitati hardcodate:
+//     exemplele de la rulare sunt ALESE automat din structurile descoperite.
+//   - ROLURI DESCOPERITE: care token e relatie se afla distributional
+//     (pozitie de mijloc). Sursa/tinta/corp ies din pozitie + aritate.
+//   - MODURI emergente de relatie (abstractie / lant-cauzal / scop / definitie)
+//     calculate din semnatura in graf, nu din nume.
+//   - REGULI descoperite + FORWARD-CHAINING (muchii derivate, reutilizate).
+//   - "NEXT-TOKEN PE GRAF" (generativ): urmatorul token NU iese dintr-o matrice
+//     de greutati, ci e ALES dintre VECINII fizici din graf; transformerul mic
+//     doar SCORzeaza candidatii dupa similaritatea cu vectorul de context.
+//       * mod determinist (logica/programare): doar muchii reale, conf maxima.
+//       * mod creativ (poezie/metafora): cand nu exista muchie, "sare" la cel
+//         mai apropiat nod in embedding (legatura semantica, nu fizica).
+//   - ANCORE CONTEXTUALE: nod = (token, domeniu) => "for"@lang != "for"@code.
+//   - TOKENI VIRTUALI: stari/intentii ([cod_valid], ...) traversate de planner
+//     (planner-ul devine "compilator": planuieste structura inainte de cuvinte).
+//   - AUTO-REWRITE: o muchie care duce intr-o fundatura poate fi PENALIZATA
+//     (confidence redus) => "uitare"/auto-corectie.
+//   - Memoria lumii = GRAF, nu greutatile. Traversare determinista =>
+//     anti-halucinatie: daca nu exista drum (si nu e mod creativ) => "Nu stiu".
+//   - Transformerul e DOAR encoder de embeddings / context, nu baza de date.
 //
 //  C++17, un singur fisier, fara librarii externe.
 //  Compilare:  g++ -O2 -std=c++17 concept_engine.cpp -o ce
+//  Rulare:     ./ce [knowledge.txt]      (sau:  ./ce < knowledge.txt)
 // ============================================================================
 
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -55,9 +57,13 @@ static mt19937 rng(7);
 // ----------------------------------------------------------------------------
 vector<string> split(const string& s){
     vector<string> r; string w;
-    for(char c:s){ if(c==' '){ if(!w.empty()) r.push_back(w); w.clear(); } else w+=c; }
+    for(char c:s){ if(c==' '||c=='\t'){ if(!w.empty()) r.push_back(w); w.clear(); } else w+=c; }
     if(!w.empty()) r.push_back(w);
     return r;
+}
+string trim(const string& s){
+    size_t a=s.find_first_not_of(" \t\r\n"); if(a==string::npos) return "";
+    size_t b=s.find_last_not_of(" \t\r\n"); return s.substr(a,b-a+1);
 }
 float dot(const vector<float>&a,const vector<float>&b){
     float s=0; for(size_t i=0;i<a.size();i++) s+=a[i]*b[i]; return s;
@@ -68,14 +74,12 @@ float cosSim(const vector<float>&a,const vector<float>&b){
 }
 
 // ============================================================================
-//  PARTEA A — ENCODER NEURAL (Transformer mic): produce embeddings de tokeni
+//  PARTEA A — ENCODER NEURAL (Transformer mic): embeddings + vector de context
 // ----------------------------------------------------------------------------
-//  Rol: detector de pattern / generator de embeddings. Invata sa prezica
-//  next-token pe dataset, iar ca efect secundar embeddingurile tokenilor care
-//  apar in contexte similare devin apropiate. Folosim aceste embeddings la
-//  clustering de concepte si la masurat similaritate. NU stocheaza fapte.
-//  (Arhitectura: RMSNorm + multi-head attention + SwiGLU + AdamW — schelet
-//  modern, mic; antrenare reala dar usoara.)
+//  Invata next-token pe corpus; ca efect secundar embeddingurile tokenilor din
+//  contexte similare devin apropiate. In generare il folosim ca SCORER: scoate
+//  un vector de context din secventa de pana acum, cu care sortam vecinii din
+//  graf. NU stocheaza fapte.
 // ============================================================================
 
 struct Mat {
@@ -157,7 +161,6 @@ struct Encoder {
         Cache c; c.ids=ids; int n=ids.size(); c.n=n;
         c.emb.assign(n,vector<float>(D));
         for(int t=0;t<n;t++)for(int i=0;i<D;i++)c.emb[t][i]=tokEmb.at(ids[t],i);
-        // attention block
         c.a_n.resize(n);c.a_inv.resize(n);c.a_xn.resize(n);
         c.q.resize(n);c.k.resize(n);c.vv.resize(n);
         for(int t=0;t<n;t++){
@@ -175,7 +178,6 @@ struct Encoder {
         }
         c.res1.assign(n,vector<float>(D));
         for(int t=0;t<n;t++){auto o=matmul(c.attn[t],Wo);for(int i=0;i<D;i++)c.res1[t][i]=c.emb[t][i]+o[i];}
-        // ffn block (SwiGLU)
         c.f_n.resize(n);c.f_inv.resize(n);c.f_xn.resize(n);
         c.up.resize(n);c.gate.resize(n);c.act.resize(n);c.ffn.resize(n);
         c.out.assign(n,vector<float>(D));
@@ -186,16 +188,14 @@ struct Encoder {
             c.ffn[t]=matmul(c.act[t],W2);
             for(int i=0;i<D;i++)c.out[t][i]=c.res1[t][i]+c.ffn[t][i];
         }
-        // final norm -> hidden (folosit ca embedding contextual)
         c.hid.resize(n);c.nf_inv.resize(n);c.nf_xn.resize(n);
         for(int t=0;t<n;t++){float inv;vector<float> xn;c.hid[t]=nf.fwd(c.out[t],inv,xn);c.nf_inv[t]=inv;c.nf_xn[t]=xn;}
         return c;
     }
     vector<float> logits(const vector<float>&h){return matmul(h,head);}
 
-    // antrenare LM (next-token la fiecare pozitie)
     float trainSeq(const vector<int>&ids){
-        int n=ids.size(); Cache c=forward(ids);
+        int n=ids.size(); if(n<2) return 0; Cache c=forward(ids);
         vector<vector<float>> dHid(n,vector<float>(D,0));
         float loss=0;int cnt=0;
         for(int t=0;t<n-1;t++){
@@ -241,37 +241,49 @@ struct Encoder {
         for(int t=0;t<n;t++)for(int i=0;i<D;i++)tokEmb.gat(ids[t],i)+=dEmb[t][i];
         return cnt?loss/cnt:0;
     }
-    // embedding "static" al unui token (din tabela), folosit la clustering
     vector<float> tokenVec(int id){vector<float> v(D);for(int i=0;i<D;i++)v[i]=tokEmb.at(id,i);return v;}
+    // vector de context = hidden-ul ultimei pozitii din secventa (folosit la generare)
+    vector<float> contextVec(const vector<int>& ids){
+        if(ids.empty()) return vector<float>(D,0);
+        Cache c=forward(ids); return c.hid.back();
+    }
 };
 
 // ============================================================================
-//  PARTEA B — TOKENIZER generic
+//  PARTEA B — TOKENIZER cu ANCORE CONTEXTUALE (token, domeniu)
+// ----------------------------------------------------------------------------
+//  Un nod nu e doar un cuvant, ci un cuvant intr-un DOMENIU. Stocam intern
+//  "domeniu|cuvant" => acelasi "for" in NL si in cod sunt noduri diferite.
+//  Tokenii virtuali (suprafata incepe cu '[') sunt stari/intentii structurale.
 // ============================================================================
 struct Tokenizer {
     unordered_map<string,int> id; vector<string> word;
+    static string key(const string& surface,const string& domain){
+        return domain.empty()? surface : domain+"|"+surface;
+    }
     int add(const string&s){auto it=id.find(s);if(it!=id.end())return it->second;
         int x=word.size();id[s]=x;word.push_back(s);return x;}
+    int addDom(const string& surface,const string& domain){ return add(key(surface,domain)); }
     int get(const string&s)const{auto it=id.find(s);return it==id.end()?-1:it->second;}
-    vector<int> enc(const string&s){vector<int> r;for(auto&w:split(s))r.push_back(add(w));return r;}
+    int getDom(const string& surface,const string& domain)const{ return get(key(surface,domain)); }
     string name(int id)const{return (id>=0&&id<(int)word.size())?word[id]:"?";}
+    // afisaj prietenos: "domeniu|cuvant" -> "cuvant@domeniu"
+    string pretty(int id)const{
+        string s=name(id); auto p=s.find('|');
+        return p==string::npos? s : s.substr(p+1)+"@"+s.substr(0,p);
+    }
+    string surface(int id)const{ string s=name(id); auto p=s.find('|'); return p==string::npos?s:s.substr(p+1); }
+    bool isVirtual(int id)const{ return !surface(id).empty() && surface(id)[0]=='['; }
 };
 
 // ============================================================================
 //  PARTEA C — DESCOPERIRE DE ROLURI (fara adnotare manuala)
 // ----------------------------------------------------------------------------
-//  Nu mai exista "role_0/rel/role_1". Primim text brut. Descoperim ce token
-//  este o RELATIE (conector) folosind o semnatura distributionala:
-//    un token este relatie daca apare PREDOMINANT in pozitie de mijloc
-//    (nici primul, nici ultimul) — adica leaga doua capete.
-//  Sursa/tinta ies apoi din pozitia fata de relatie. Aritatea (cati tokeni
-//  raman dupa relatie) distinge un FAPT (o singura tinta) de o DEFINITIE
-//  (corp multi-token).
+//  Care token e RELATIE (conector) se afla distributional: apare PREDOMINANT
+//  in pozitie de mijloc. Sursa/tinta/corp ies din pozitie + aritate.
 // ============================================================================
 struct RoleDiscovery {
-    unordered_set<int> relationTokens;   // tokeni descoperiti ca fiind conectori
-
-    // pasul 1: invata din corpus brut care tokeni sunt relatii
+    unordered_set<int> relationTokens;
     void learn(const vector<vector<int>>& corpus){
         unordered_map<int,int> mid,tot;
         for(auto& s:corpus){
@@ -282,14 +294,12 @@ struct RoleDiscovery {
         }
         for(auto& kv:tot){
             int t=kv.first, total=kv.second, m=mid.count(t)?mid[t]:0;
-            // majoritate STRICTA de aparitii in mijloc => conector/relatie
-            if(m>0 && m*2>total) relationTokens.insert(t);
+            if(m>0 && m*2>total) relationTokens.insert(t);   // majoritate stricta in mijloc
         }
     }
     bool isRelation(int t)const{ return relationTokens.count(t)>0; }
 };
 
-// relation_id descoperite din pattern-uri de relatie (run-ul de conectori)
 struct RelationVocab {
     unordered_map<string,int> id; vector<string> pattern;
     int discover(const string&p){auto it=id.find(p);if(it!=id.end())return it->second;
@@ -297,33 +307,26 @@ struct RelationVocab {
     int get(const string&p)const{auto it=id.find(p);return it==id.end()?-1:it->second;}
 };
 
-// rezultatul parsarii unei propozitii brute, dupa rolurile DESCOPERITE
 struct Parsed {
-    bool ok=false;
-    bool isDefinition=false;
+    bool ok=false, isDefinition=false;
     int src=-1, dst=-1, relation_id=-1;
-    vector<int> body;          // corpul definitiei (daca isDefinition)
-    string relPattern;
+    vector<int> body; string relPattern;
 };
 
-// Parser pe baza rolurilor descoperite:
-//   src   = capatul de dinaintea primei relatii
-//   rel   = run-ul contiguu de tokeni-relatie
-//   dupa  = ce ramane: 1 token => FAPT (dst), >=2 tokeni => DEFINITIE (body)
+// src = capatul de dinaintea primei relatii; rel = run-ul de conectori;
+// dupa rel: 1 token => FAPT (dst); >=2 tokeni => DEFINITIE (body).
 Parsed parseByDiscoveredRoles(const vector<int>& ids, const RoleDiscovery& rd,
                               Tokenizer& tok, RelationVocab& rv){
     Parsed p;
     if(ids.size()<3) return p;
-    // gaseste prima relatie (nu poate fi pe pozitia 0)
     int r0=-1;
     for(size_t i=1;i<ids.size();i++){ if(rd.isRelation(ids[i])){ r0=i; break; } }
     if(r0<=0) return p;
     p.src=ids[r0-1];
-    // run-ul de conectori
     int r1=r0; string relPat;
     while(r1<(int)ids.size() && rd.isRelation(ids[r1])){
         if(!relPat.empty()) relPat+=" ";
-        relPat+=tok.name(ids[r1]); r1++;
+        relPat+=tok.surface(ids[r1]); r1++;
     }
     int rem=(int)ids.size()-r1;
     if(rem<=0) return p;
@@ -334,11 +337,7 @@ Parsed parseByDiscoveredRoles(const vector<int>& ids, const RoleDiscovery& rd,
 }
 
 // ============================================================================
-//  PARTEA D — GRAPH MEMORY (memoria lumii: noduri + muchii)
-// ----------------------------------------------------------------------------
-//  Un nod = un token/concept (node_id == token_id, generic).
-//  O muchie = (src) --relation_id--> (dst), cu confidence, marcata `derived`
-//  daca a fost DEDUSA de motor (forward-chaining), nu observata direct.
+//  PARTEA D — GRAPH MEMORY (noduri + muchii). Suporta penalizare (auto-rewrite).
 // ============================================================================
 struct Edge { int src,dst,relation_id; float confidence; bool derived; };
 
@@ -365,33 +364,29 @@ struct GraphMemory {
         return r;
     }
     bool hasOutgoing(int src)const{ auto it=outAdj.find(src); return it!=outAdj.end()&&!it->second.empty(); }
+    // AUTO-REWRITE: scade confidence-ul unei muchii (uitare / penalizare)
+    bool penalize(int src,int dst,int rel,float factor){
+        auto it=outAdj.find(src); if(it==outAdj.end())return false;
+        for(int ei:it->second) if(edges[ei].dst==dst&&edges[ei].relation_id==rel){
+            edges[ei].confidence*=factor; return true; }
+        return false;
+    }
 };
 
 // ============================================================================
-//  PARTEA E — CONCEPT MEMORY (concepte descoperite = ABSTRACTIE emergenta)
-// ----------------------------------------------------------------------------
-//  Cum apare un "concept": daca MULTI tokeni-sursa pointeaza catre acelasi
-//  token-tinta prin ACEEASI relatie (multi X --r--> "om"), tinta ("om") e
-//  promovata la CONCEPT, iar sursele devin INSTANTE. Pragul (minim de
-//  instante) e singurul parametru; categoria nu e numita. Aceasta E
-//  abstractia descoperita ceruta de audit.
+//  PARTEA E — CONCEPT MEMORY (abstractie emergenta = tinta is-a cu >=N surse)
 // ============================================================================
 struct ConceptMemory {
     set<int> concepts;
     unordered_map<int,set<int>> instances;
     unordered_map<int,int> instanceOf;
-
-    // Promovam la concept DOAR tinte ale relatiilor de ABSTRACTIE (is-a)
-    // descoperite (absRels), ca sa nu confundam convergenta cauzala (mai multe
-    // resurse -> aceeasi tinta) cu o categorie.
     void discover(const GraphMemory& g,int minInst,const set<int>& absRels){
         map<pair<int,int>,set<int>> bucket;
         for(auto& e:g.edges) if(!e.derived && absRels.count(e.relation_id))
             bucket[{e.dst,e.relation_id}].insert(e.src);
         for(auto& kv:bucket){
             if((int)kv.second.size()>=minInst){
-                int concept=kv.first.first;
-                concepts.insert(concept);
+                int concept=kv.first.first; concepts.insert(concept);
                 for(int inst:kv.second){ instances[concept].insert(inst); instanceOf[inst]=concept; }
             }
         }
@@ -400,10 +395,7 @@ struct ConceptMemory {
 };
 
 // ============================================================================
-//  PARTEA F — DEFINITION MEMORY (definitii descoperite)
-// ----------------------------------------------------------------------------
-//  O definitie e legatura termen->{tokeni-corp}, descoperita din aritate (vezi
-//  parser-ul). Utila in lantul de inferenta ca "expandare" a unui concept.
+//  PARTEA F — DEFINITION MEMORY (definitii descoperite prin aritate)
 // ============================================================================
 struct DefinitionMemory {
     unordered_map<int,vector<int>> def;
@@ -413,51 +405,31 @@ struct DefinitionMemory {
 };
 
 // ============================================================================
-//  PARTEA G — RELATION MODES (cauza / efect / scop / abstractie DESCOPERITE)
-// ----------------------------------------------------------------------------
-//  Fiecare relatie primeste un MOD emergent, calculat din semnatura ei in graf
-//  — NU dintr-un nume scris in cod:
-//    ABSTRACTION : fan-in mare (multe surse -> putine tinte) => is-a/clasa.
-//    CHAIN       : tintele devin la randul lor surse => lant cauza-efect/mijloc.
-//    GOAL        : pattern de relatie multi-cuvant (relatie oblica, ex. un
-//                  conector secundar) => tinta e un SCOP/nevoie.
-//    PLAIN       : altceva (ex. localizare punctuala).
-//  Aceste moduri sunt apoi REUTILIZATE de motorul de rationament.
+//  PARTEA G — RELATION MODES (abstractie / lant / scop, descoperite din graf)
 // ============================================================================
 enum RelMode { PLAIN=0, ABSTRACTION=1, CHAIN=2, GOAL=3 };
 const char* modeName(int m){
     switch(m){case ABSTRACTION:return "ABSTRACTION(is-a)";case CHAIN:return "CHAIN(cauza->efect)";
               case GOAL:return "GOAL(scop)";default:return "PLAIN";}
 }
-
 struct RelationModes {
-    unordered_map<int,int> mode;            // relation_id -> RelMode
-    set<int> goalTargets;                    // tinte ale relatiilor de tip GOAL
-
+    unordered_map<int,int> mode;
+    set<int> goalTargets;
     void discover(const GraphMemory& g, const RelationVocab& rv){
-        // statistici per relatie
-        map<int,map<int,set<int>>> dstSrc;   // rel -> dst -> {src}
-        map<int,set<int>> dsts;              // rel -> {dst}
+        map<int,map<int,set<int>>> dstSrc; map<int,set<int>> dsts;
         for(auto& e:g.edges){ if(e.derived) continue;
             dstSrc[e.relation_id][e.dst].insert(e.src); dsts[e.relation_id].insert(e.dst); }
-
         for(auto& kv:dstSrc){
             int rel=kv.first;
-            // fan-in: cate tinte sunt "clase" (au >=2 surse distincte)?
             int maxFanIn=0, classes=0;
             for(auto& d:kv.second){ int f=d.second.size(); maxFanIn=max(maxFanIn,f); if(f>=2) classes++; }
-            // chain: ce fractie din tinte au, la randul lor, muchii iesite?
             int cont=0,tot=0; for(int d:dsts[rel]){ tot++; if(g.hasOutgoing(d)) cont++; }
             float chainFrac = tot? (float)cont/tot : 0.f;
-            // goal: pattern-ul relatiei are mai multe cuvinte (relatie oblica)
             bool multiWord = split(rv.pattern[rel]).size()>=2;
-
-            // O TAXONOMIE reala are mai multe clase, fiecare cu >=2 instante
-            // (asa separam is-a de simpla convergenta cauzala pe o tinta).
             if(multiWord){ mode[rel]=GOAL; for(int d:dsts[rel]) goalTargets.insert(d); }
             else if(classes>=2) mode[rel]=ABSTRACTION;
             else if(chainFrac>=0.5f) mode[rel]=CHAIN;
-            else if(maxFanIn>=2) mode[rel]=ABSTRACTION;  // o clasa clara, fara lant
+            else if(maxFanIn>=2) mode[rel]=ABSTRACTION;
             else mode[rel]=PLAIN;
         }
     }
@@ -467,48 +439,31 @@ struct RelationModes {
 };
 
 // ============================================================================
-//  PARTEA H — RULE ENGINE (descoperire de reguli + forward-chaining)
-// ----------------------------------------------------------------------------
-//  Regula descoperita generic (MOSTENIRE DE CATEGORIE):
-//     daca  X --r--> Y   si   Y --(ABSTRACTION)--> Z   atunci   X --(ABSTRACTION)--> Z
-//  Adica: daca stiu ce e Y (clasa lui) si X e legat de Y, X mosteneste clasa.
-//  Ex: Ion --lucreaza--> sofer ; sofer --este--> meserie  =>  Ion --este--> meserie.
-//  Muchiile rezultate sunt DERIVATE (confidence redus) si reutilizabile mai
-//  departe (inchidere prin iteratie pana la punct fix) => rationament multi-pas.
+//  PARTEA H — RULE ENGINE (mostenire de categorie + forward-chaining)
 // ============================================================================
 struct DiscoveredRule { string desc; int applications=0; };
-
 struct RuleEngine {
-    // intoarce regulile descoperite; modifica graful adaugand muchii derivate
     vector<DiscoveredRule> run(GraphMemory& g, const RelationModes& rm, const RelationVocab& rv){
         vector<DiscoveredRule> rules;
-        // ce relatii sunt de abstractie?
         set<int> absRels; for(auto& kv:rm.mode) if(kv.second==ABSTRACTION) absRels.insert(kv.first);
         if(absRels.empty()) return rules;
-
-        // descrie regula (folosind pattern-uri DESCOPERITE, nu literali din cod)
         for(int ar:absRels){
             DiscoveredRule r; r.desc = "daca X --(orice)--> Y si Y --[" + rv.pattern[ar] +
                 "]--> Z atunci X --[" + rv.pattern[ar] + "]--> Z  (mostenire de categorie)";
             rules.push_back(r);
         }
-
-        // forward-chaining pana la punct fix
         bool changed=true; int guard=0;
         while(changed && guard++<8){
-            changed=false;
-            int m=g.edges.size();
+            changed=false; int m=g.edges.size();
             for(int i=0;i<m;i++){
-                Edge e=g.edges[i];                 // X --r--> Y
-                // Y --ABS--> Z ?
+                Edge e=g.edges[i];
                 for(int ar:absRels){
-                    for(auto* ae:g.query(e.dst,ar)){   // Y --ar--> Z
-                        if(e.src==ae->dst) continue;   // fara auto-bucla
+                    for(auto* ae:g.query(e.dst,ar)){
+                        if(e.src==ae->dst) continue;
                         float conf=e.confidence*ae->confidence*0.9f;
                         size_t before=g.edges.size();
                         g.addEdge(e.src,ae->dst,ar,conf,true);
-                        if(g.edges.size()>before){     // s-a adaugat o muchie noua
-                            changed=true;
+                        if(g.edges.size()>before){ changed=true;
                             for(auto& rr:rules)
                                 if(rr.desc.find("["+rv.pattern[ar]+"]")!=string::npos) rr.applications++;
                         }
@@ -521,14 +476,8 @@ struct RuleEngine {
 };
 
 // ============================================================================
-//  PARTEA I — REASONING ENGINE (traversare determinista multi-pas + scop)
-// ----------------------------------------------------------------------------
-//  Raspunde cautand DRUMURI in graf. Daca nu exista drum => "Nu stiu"
-//  (anti-halucinatie). "De ce" => lant cauza->scop, verbalizat din pattern-uri.
-//  "Planner" => cauta un drum catre un scop dat. Totul determinist; confidence
-//  se propaga ca produs al muchiilor.
+//  PARTEA I — REASONING ENGINE (traversare multi-pas + scop + planner)
 // ============================================================================
-struct Step { int from,to,rel; };
 struct Chain { vector<int> nodes; vector<int> rels; float confidence=0; };
 
 struct ReasoningEngine {
@@ -537,12 +486,9 @@ struct ReasoningEngine {
     ReasoningEngine(GraphMemory&G,ConceptMemory&C,DefinitionMemory&D,RelationModes&M,
                     Tokenizer&T,RelationVocab&R):g(G),cm(C),dm(D),rm(M),tok(T),rv(R){}
 
-    vector<int> direct(int src,int rel){
-        vector<int> r; for(auto*e:g.query(src,rel)) r.push_back(e->dst); return r;
-    }
-    string nodeName(int id){ return tok.name(id); }
+    vector<int> direct(int src,int rel){ vector<int> r; for(auto*e:g.query(src,rel)) r.push_back(e->dst); return r; }
+    string nodeName(int id){ return tok.pretty(id); }
 
-    // cel mai lung lant (conf maxima la egalitate) pornind din 'start'
     Chain bestChain(int start,int maxDepth){
         struct St{int node;vector<int> nodes;vector<int> rels;float conf;};
         Chain best; best.nodes={start}; best.confidence=1.0f;
@@ -565,8 +511,6 @@ struct ReasoningEngine {
         }
         return best;
     }
-
-    // PLANNER: drum cel mai scurt de la 'start' la 'goal' (BFS pe muchii)
     Chain plan(int start,int goal,int maxDepth){
         struct St{int node;vector<int> nodes;vector<int> rels;float conf;};
         queue<St> q; q.push({start,{start},{},1.0f});
@@ -578,14 +522,11 @@ struct ReasoningEngine {
             for(auto*e:g.outgoing(s.node)){
                 if(visited.count(e->dst)) continue; visited.insert(e->dst);
                 St ns=s; ns.node=e->dst; ns.nodes.push_back(e->dst);
-                ns.rels.push_back(e->relation_id); ns.conf*=e->confidence;
-                q.push(ns);
+                ns.rels.push_back(e->relation_id); ns.conf*=e->confidence; q.push(ns);
             }
         }
-        return Chain{}; // gol => nu exista plan
+        return Chain{};
     }
-
-    // verbalizeaza un lant ca pasi "a [pattern] b"
     string verbalize(const Chain& ch){
         if(ch.nodes.size()<2) return "Nu stiu.";
         string s;
@@ -596,35 +537,21 @@ struct ReasoningEngine {
         char buf[40]; snprintf(buf,sizeof buf," (confidence=%.2f)",ch.confidence);
         return s+buf;
     }
-
-    // "DE CE ...?" — construieste lantul cauza->scop si il verbalizeaza ca scop.
-    //  Strategie: pornim din actor, luam cel mai lung lant; gasim primul nod
-    //  care e un SCOP descoperit (tinta a unei relatii GOAL) si formulam
-    //  "Pentru a obtine <scop>", apoi continuam lantul ca justificare.
     string why(int actor){
-        // 1) cel mai apropiat SCOP atins de actor (BFS), + drumul-mijloc spre el
-        int goal=-1; Chain means;
-        {
-            struct St{int node;vector<int> nodes;vector<int> rels;float conf;};
-            queue<St> q; q.push({actor,{actor},{},1.0f});
-            set<int> vis; vis.insert(actor);
-            while(!q.empty()){
-                St s=q.front();q.pop();
-                if(s.node!=actor && rm.isGoalTarget(s.node)){
-                    goal=s.node; means.nodes=s.nodes;means.rels=s.rels;means.confidence=s.conf; break;
-                }
-                if((int)s.nodes.size()>=8) continue;
-                for(auto*e:g.outgoing(s.node)){ if(vis.count(e->dst))continue; vis.insert(e->dst);
-                    St ns=s; ns.node=e->dst; ns.nodes.push_back(e->dst);
-                    ns.rels.push_back(e->relation_id); ns.conf*=e->confidence; q.push(ns); }
-            }
+        int goal=-1;
+        struct St{int node;vector<int> nodes;vector<int> rels;float conf;};
+        queue<St> q; q.push({actor,{actor},{},1.0f});
+        set<int> vis; vis.insert(actor);
+        while(!q.empty()){
+            St s=q.front();q.pop();
+            if(s.node!=actor && rm.isGoalTarget(s.node)){ goal=s.node; break; }
+            if((int)s.nodes.size()>=8) continue;
+            for(auto*e:g.outgoing(s.node)){ if(vis.count(e->dst))continue; vis.insert(e->dst);
+                St ns=s; ns.node=e->dst; ns.nodes.push_back(e->dst);
+                ns.rels.push_back(e->relation_id); ns.conf*=e->confidence; q.push(ns); }
         }
-        if(goal<0){
-            Chain ch=bestChain(actor,8);
-            if(ch.nodes.size()<2) return "Nu stiu.";
-            return "Pentru ca: " + verbalize(ch);
-        }
-        // 2) de ce conteaza scopul = lantul continuat din scop (justificare)
+        if(goal<0){ Chain ch=bestChain(actor,8); if(ch.nodes.size()<2) return "Nu stiu.";
+                    return "Pentru ca: " + verbalize(ch); }
         string out = "Pentru a obtine " + nodeName(goal);
         Chain cont = bestChain(goal,6);
         if(cont.nodes.size()>=2){
@@ -633,11 +560,8 @@ struct ReasoningEngine {
                 just += nodeName(cont.nodes[i])+" "+rv.pattern[cont.rels[i]]+" "+nodeName(cont.nodes[i+1]); }
             out += " (necesar pentru: " + just + ")";
         }
-        out += ".";
-        return out;
+        return out + ".";
     }
-
-    // expandeaza un concept prin definitia lui (daca exista)
     string expandDefinition(int term){
         if(!dm.has(term)) return "";
         auto& body=dm.def.at(term);
@@ -648,214 +572,276 @@ struct ReasoningEngine {
 };
 
 // ============================================================================
-//  PARTEA J — MAIN: dataset BRUT (fara scheme) + descoperire + inferenta
+//  PARTEA J — GENERATOR: "NEXT-TOKEN PE GRAF"
+// ----------------------------------------------------------------------------
+//  Bucla de generare ("The Loop"): din nodul curent, candidatii sunt VECINII
+//  fizici din graf. Transformerul scoate vectorul de context al secventei de
+//  pana acum; fiecare candidat e scorat = confidence * (0.5 + 0.5*cosSim).
+//    - mod determinist: doar muchii reale (anti-halucinatie, oprire la fundatura)
+//    - mod creativ: la fundatura, "sare" la cel mai apropiat nod in embedding
+//      (legatura semantica/metafora, fara muchie fizica).
 // ============================================================================
-int main(){
-    Tokenizer tok;
-    RelationVocab rv;
-    GraphMemory graph;
-    ConceptMemory concepts;
-    DefinitionMemory defs;
-    RelationModes modes;
+struct GenStep { int node; int rel; bool jump; };   // rel==-1 & jump => salt creativ
+struct Generated { vector<GenStep> steps; };
 
-    // ------------------------------------------------------------------
-    //  DATASET — DOAR TEXT BRUT. Fara nicio schema de roluri.
-    //  Sistemul descopera singur ce e relatie si ce e capat.
-    // ------------------------------------------------------------------
-    vector<string> facts = {
-        // is-a (vor genera concepte prin recurenta tintei => ABSTRACTION)
-        "Ion este om",
-        "Vasile este om",
-        "Maria este om",
-        "pisica este animal",
-        "caine este animal",
-        "sofer este meserie",
-        "mecanic este meserie",
-        // ocupatii concrete
-        "Ion lucreaza sofer",
-        "Vasile lucreaza mecanic",
-        // localizari punctuale (relatie PLAIN)
-        "pisica sta masa",
-        "telefon sta birou",
-        // lant cauza-efect / mijloc-scop (CHAIN)
-        "sofer face munca",
-        "munca produce bani",
-        "bani cumpara hrana",
-        "hrana sustine om",
-        "meserie produce venit",
-        "venit cumpara hrana",
-        // scopuri (relatie oblica, multi-cuvant => GOAL)
-        "om munceste pentru bani",
-        "om mananca pentru energie",
-    };
+struct Generator {
+    GraphMemory& g; Encoder& enc; Tokenizer& tok; RelationModes& rm;
+    Generator(GraphMemory&G,Encoder&E,Tokenizer&T,RelationModes&M):g(G),enc(E),tok(T),rm(M){}
 
-    // definitii — tot text brut; sunt recunoscute prin ARITATE (corp >1 token)
-    vector<string> definitions = {
-        "meserie inseamna activitate care aduce bani",
-        "animal inseamna fiinta vie",
-        "om inseamna fiinta vie",
-        "hrana inseamna energie pentru corp",
-    };
+    Generated generate(int seed,int maxLen,bool creative){
+        Generated out; out.steps.push_back({seed,-1,false});
+        vector<int> ids={seed}; set<int> visited={seed}; int cur=seed;
+        for(int step=0; step<maxLen; step++){
+            vector<const Edge*> cand;
+            for(auto*e:g.outgoing(cur)) if(!visited.count(e->dst)) cand.push_back(e);
+            const Edge* pick=nullptr; int jump=-1;
+            if(!cand.empty()){
+                auto cv=enc.contextVec(ids); float bs=-1e9f;
+                for(auto*e:cand){
+                    float sim=cosSim(cv,enc.tokenVec(e->dst));
+                    float sc=e->confidence*(0.5f+0.5f*sim);
+                    if(sc>bs){bs=sc;pick=e;}
+                }
+            } else if(creative){
+                auto cv=enc.contextVec(ids); float bs=0.20f;   // prag minim de "rezonanta"
+                for(int t=0;t<(int)tok.word.size();t++){
+                    if(visited.count(t)) continue;
+                    float sim=cosSim(cv,enc.tokenVec(t));
+                    if(sim>bs){bs=sim;jump=t;}
+                }
+            }
+            if(pick){ ids.push_back(pick->dst); visited.insert(pick->dst);
+                      out.steps.push_back({pick->dst,pick->relation_id,false}); cur=pick->dst; }
+            else if(jump>=0){ ids.push_back(jump); visited.insert(jump);
+                      out.steps.push_back({jump,-1,true}); cur=jump; }
+            else break;   // anti-halucinatie: nu inventa muchii
+        }
+        return out;
+    }
+    string show(const Generated& gen, const RelationVocab& rv){
+        string s=tok.pretty(gen.steps[0].node);
+        for(size_t i=1;i<gen.steps.size();i++){
+            const auto& st=gen.steps[i];
+            s += st.jump ? string("  ~(salt)~> ") : "  -("+rv.pattern[st.rel]+")-> ";
+            s += tok.pretty(st.node);
+        }
+        return s;
+    }
+};
 
-    // ---- pre-tokenizare pentru encoder + descoperirea rolurilor ----
-    vector<vector<int>> factIds, defIds, corpus;
-    for(auto& s:facts){ auto v=tok.enc(s); factIds.push_back(v); corpus.push_back(v); }
-    for(auto& s:definitions){ auto v=tok.enc(s); defIds.push_back(v); corpus.push_back(v); }
+// ============================================================================
+//  PARTEA K — LOADER: invata PRIN CITIRE dintr-un corpus extern (nu din cod)
+// ----------------------------------------------------------------------------
+//  Sectiuni [FACTS] / [DEFINITIONS], antet optional @domeniu (ancora).
+//  '#' = comentariu. Liniile sunt singura sursa de cunostinte.
+// ============================================================================
+struct Corpus {
+    vector<vector<int>> factIds, defIds, all;   // tokenizate (cu domeniu aplicat)
+};
+Corpus loadCorpus(istream& in, Tokenizer& tok){
+    Corpus c; string line; string section="FACTS", domain="";
+    while(getline(in,line)){
+        line=trim(line);
+        if(line.empty()||line[0]=='#') continue;
+        if(line[0]=='['){
+            string inside=line.substr(1, line.find(']')==string::npos? line.size()-1 : line.find(']')-1);
+            auto parts=split(inside); domain="";
+            if(!parts.empty()){
+                section = parts[0];
+                for(size_t i=1;i<parts.size();i++) if(parts[i][0]=='@') domain=parts[i].substr(1);
+            }
+            continue;
+        }
+        auto words=split(line); if(words.empty()) continue;
+        vector<int> ids; for(auto& w:words) ids.push_back(tok.addDom(w,domain));
+        c.all.push_back(ids);
+        if(section=="DEFINITIONS") c.defIds.push_back(ids);
+        else c.factIds.push_back(ids);
+    }
+    return c;
+}
 
-    // ---- antreneaza encoderul (DOAR pentru embeddings/pattern) ----
+// ============================================================================
+//  PARTEA L — MAIN
+// ============================================================================
+int main(int argc,char** argv){
+    Tokenizer tok; RelationVocab rv; GraphMemory graph;
+    ConceptMemory concepts; DefinitionMemory defs; RelationModes modes;
+
+    // ---- INVATA PRIN CITIRE: corpus din argv[1] / "knowledge.txt" / stdin ----
+    Corpus corp;
+    string path = argc>1? argv[1] : "knowledge.txt";
+    { ifstream f(path);
+      if(f){ cout<<"== Citesc cunostinte din \""<<path<<"\" ==\n"; corp=loadCorpus(f,tok); }
+      else { cout<<"== Citesc cunostinte din stdin ==\n"; corp=loadCorpus(cin,tok); } }
+    if(corp.all.empty()){ cout<<"(corpus gol — nimic de invatat)\n"; return 0; }
+
+    // ---- antreneaza encoderul (DOAR pentru embeddings / vector de context) ----
     Encoder enc(tok.word.size(), 16, 32, 64, 4);
-    cout<<"== Antrenez encoderul (doar pentru embeddings/pattern) ==\n";
+    cout<<"== Antrenez encoderul (embeddings/context) ==\n";
     float lr=0.005f,wd=0.001f,step=0;
     for(int ep=0;ep<150;ep++){
-        float tot=0;int c=0;
-        vector<int> ord(corpus.size());for(int i=0;i<(int)ord.size();i++)ord[i]=i;
+        float tot=0;int cc=0;
+        vector<int> ord(corp.all.size()); for(int i=0;i<(int)ord.size();i++)ord[i]=i;
         shuffle(ord.begin(),ord.end(),rng);
-        for(int idx:ord){enc.zerograd();tot+=enc.trainSeq(corpus[idx]);step++;enc.step(lr,step,wd);c++;}
-        if(ep%50==0)cout<<"  epoch "<<ep<<"  loss "<<tot/c<<"\n";
+        for(int idx:ord){enc.zerograd();tot+=enc.trainSeq(corp.all[idx]);step++;enc.step(lr,step,wd);cc++;}
+        if(ep%50==0)cout<<"  epoch "<<ep<<"  loss "<<tot/cc<<"\n";
     }
     cout<<"Done.\n\n";
 
-    // ---- DESCOPERA rolurile (care tokeni sunt relatii) din corpusul de fapte
-    RoleDiscovery roles;
-    roles.learn(factIds);
-
-    // ---- PARSEAZA faptele pe baza rolurilor descoperite -> graf ----
-    for(auto& ids:factIds){
+    // ---- DESCOPERA rolurile din fapte; parseaza -> graf ----
+    RoleDiscovery roles; roles.learn(corp.factIds);
+    for(auto& ids:corp.factIds){
         Parsed p=parseByDiscoveredRoles(ids,roles,tok,rv);
         if(p.ok && !p.isDefinition) graph.addEdge(p.src,p.dst,p.relation_id,0.95f);
     }
-    // ---- definitii: descopera conectorul (token recurent pe pozitia 1) ----
+    // ---- definitii: conectorul = tokenul recurent pe pozitia 1 ----
     {
         unordered_map<int,int> at1;
-        for(auto& ids:defIds) if(ids.size()>=3) at1[ids[1]]++;
+        for(auto& ids:corp.defIds) if(ids.size()>=3) at1[ids[1]]++;
         int connector=-1,best=0; for(auto&kv:at1) if(kv.second>best){best=kv.second;connector=kv.first;}
-        for(auto& ids:defIds){
+        for(auto& ids:corp.defIds){
             if((int)ids.size()<3 || ids[1]!=connector) continue;
-            int term=ids[0]; int rel=rv.discover(tok.name(connector));
+            int rel=rv.discover(tok.surface(connector));
             vector<int> body(ids.begin()+2,ids.end());
-            defs.add(term,rel,body);
+            defs.add(ids[0],rel,body);
         }
     }
 
-    // ---- DESCOPERA modurile relatiilor (abstractie/lant/scop) ----
+    // ---- moduri, concepte, reguli ----
     modes.discover(graph, rv);
     set<int> absRels; for(auto&kv:modes.mode) if(kv.second==ABSTRACTION) absRels.insert(kv.first);
-    // ---- DESCOPERA concepte (abstractie prin recurenta, doar pe relatii is-a)
     concepts.discover(graph, 2, absRels);
-    // ---- DESCOPERA reguli + FORWARD-CHAINING (muchii derivate) ----
-    RuleEngine ruleEng;
-    auto rules = ruleEng.run(graph, modes, rv);
+    RuleEngine ruleEng; auto rules = ruleEng.run(graph, modes, rv);
 
     ReasoningEngine reason(graph,concepts,defs,modes,tok,rv);
+    Generator gen(graph,enc,tok,modes);
+
+    // ---- ALEGE automat entitati de demonstrat (nimic hardcodat) ----
+    int demoActor=-1, demoGoal=-1;
+    for(int cId:concepts.concepts){
+        for(int inst:concepts.instances[cId]){
+            for(int goal:modes.goalTargets){
+                if(reason.plan(inst,goal,8).nodes.size()>=2){ demoActor=inst; demoGoal=goal; break; }
+            }
+            if(demoActor>=0) break;
+        }
+        if(demoActor>=0) break;
+    }
+    int demoConcept = concepts.concepts.empty()? -1 : *concepts.concepts.rbegin();
+    // un nod de cod (domeniu "code") si un token virtual, pentru planner-compilator
+    int codeSeed=-1, virtGoal=-1;
+    for(int i=0;i<(int)tok.word.size();i++){
+        string nm=tok.name(i);
+        if(codeSeed<0 && nm.rfind("code|",0)==0 && graph.hasOutgoing(i) && !tok.isVirtual(i)) codeSeed=i;
+        if(virtGoal<0 && tok.isVirtual(i)) virtGoal=i;
+    }
 
     // ================== OUTPUT ==================
-
-    cout<<"== 1. ROLURI DESCOPERITE (care tokeni sunt relatii) ==\n  ";
-    { bool f=true; vector<string> rs; for(int t:roles.relationTokens) rs.push_back(tok.name(t));
-      sort(rs.begin(),rs.end());
+    cout<<"== 1. ROLURI DESCOPERITE (tokeni-relatie) ==\n  ";
+    { vector<string> rs; for(int t:roles.relationTokens) rs.push_back(tok.pretty(t));
+      sort(rs.begin(),rs.end()); bool f=true;
       for(auto&s:rs){cout<<(f?"":", ")<<s;f=false;} cout<<"\n"; }
 
-    cout<<"\n== 2. RELATII descoperite + MOD emergent ==\n";
+    cout<<"\n== 2. RELATII + MOD emergent ==\n";
     set<int> defRels; for(auto&kv:defs.defRelation) defRels.insert(kv.second);
     for(int i=0;i<(int)rv.pattern.size();i++){
         string m = defRels.count(i)? "DEFINITION(definitie)" : modeName(modes.of(i));
         cout<<"  relation_id "<<i<<"  <- \""<<rv.pattern[i]<<"\"   mod: "<<m<<"\n";
     }
 
-    cout<<"\n== 3. CONCEPTE descoperite (abstractie, nu hardcodat) ==\n";
+    cout<<"\n== 3. CONCEPTE descoperite (abstractie) ==\n";
     for(int cId:concepts.concepts){
-        cout<<"  concept: "<<tok.name(cId)<<"   instante: ";
-        bool first=true;
-        for(int inst:concepts.instances[cId]){cout<<(first?"":", ")<<tok.name(inst);first=false;}
+        cout<<"  concept: "<<tok.pretty(cId)<<"   instante: ";
+        bool first=true; for(int inst:concepts.instances[cId]){cout<<(first?"":", ")<<tok.pretty(inst);first=false;}
         cout<<"\n";
     }
 
     cout<<"\n== 4. DEFINITII descoperite (prin aritate) ==\n";
     for(auto&kv:defs.def){
-        cout<<"  "<<tok.name(kv.first)<<" := ";
-        for(size_t i=0;i<kv.second.size();i++)cout<<(i?" ":"")<<tok.name(kv.second[i]);
+        cout<<"  "<<tok.pretty(kv.first)<<" := ";
+        for(size_t i=0;i<kv.second.size();i++)cout<<(i?" ":"")<<tok.pretty(kv.second[i]);
         cout<<"\n";
     }
 
-    cout<<"\n== 5. REGULI descoperite + aplicari (forward-chaining) ==\n";
+    cout<<"\n== 5. REGULI + forward-chaining ==\n";
     for(auto& r:rules) cout<<"  - "<<r.desc<<"   [aplicata de "<<r.applications<<" ori]\n";
 
-    cout<<"\n== 6. GRAF (muchii: src --relation_id--> dst) ==\n";
-    for(auto&e:graph.edges)
-        cout<<"  "<<tok.name(e.src)<<" --r"<<e.relation_id<<"--> "<<tok.name(e.dst)
-            <<"  (conf="<<e.confidence<<(e.derived?", DERIVAT":"")<<")\n";
-
-    cout<<"\n== 7. SIMILARITATE (encoder embeddings) ==\n";
-    auto sim=[&](const string&a,const string&b){
-        int ia=tok.get(a),ib=tok.get(b); if(ia<0||ib<0)return -2.0f;
-        return cosSim(enc.tokenVec(ia),enc.tokenVec(ib));
-    };
-    cout<<"  sim(Ion,Vasile)   = "<<sim("Ion","Vasile")<<"\n";
-    cout<<"  sim(Ion,pisica)   = "<<sim("Ion","pisica")<<"\n";
-    cout<<"  sim(sofer,mecanic)= "<<sim("sofer","mecanic")<<"\n";
-
-    cout<<"\n== 8. INFERENTA multi-pas (lanturi de traversare) ==\n";
-    auto chainFrom=[&](const string&startTok){
-        int s=tok.get(startTok);
-        if(s<0){cout<<"  '"<<startTok<<"': Nu stiu.\n";return;}
-        Chain ch=reason.bestChain(s,8);
-        cout<<"  lant din '"<<startTok<<"': "<<reason.verbalize(ch)<<"\n";
-    };
-    chainFrom("Ion");
-    chainFrom("sofer");
-    chainFrom("meserie");
-
-    cout<<"\n== 9. RATIONAMENT \"DE CE?\" (cauza -> scop) ==\n";
-    auto why=[&](const string&actor){
-        int a=tok.get(actor); if(a<0){cout<<"  Nu stiu.\n";return;}
-        cout<<"  De ce lucreaza/actioneaza "<<actor<<"?\n    A: "<<reason.why(a)<<"\n";
-    };
-    why("Ion");
-    why("Vasile");
-
-    cout<<"\n== 10. PLANNER (drum catre un scop) ==\n";
-    auto planTo=[&](const string&a,const string&b){
-        int s=tok.get(a),t=tok.get(b);
-        if(s<0||t<0){cout<<"  Nu stiu.\n";return;}
-        Chain p=reason.plan(s,t,8);
-        if(p.nodes.size()<2){cout<<"  plan "<<a<<" -> "<<b<<": Nu exista (Nu stiu).\n";return;}
-        cout<<"  plan "<<a<<" -> "<<b<<": "<<reason.verbalize(p)<<"\n";
-    };
-    planTo("Ion","bani");
-    planTo("Ion","hrana");
-    planTo("pisica","bani"); // nu exista drum => Nu stiu
-
-    cout<<"\n== 11. MOSTENIRE DEDUSA (intrebari pe muchii derivate) ==\n";
-    // Ce e Ion (toate categoriile, inclusiv cele DEDUSE prin reguli)?
+    cout<<"\n== 6. ANCORE CONTEXTUALE (acelasi cuvant, domenii izolate) ==\n";
     {
-        int ion=tok.get("Ion");
-        cout<<"  Ion --[abstractie]--> { ";
-        bool f=true;
-        if(ion>=0) for(int ar:absRels) for(int d:reason.direct(ion,ar)){cout<<(f?"":", ")<<tok.name(d);f=false;}
-        cout<<" }   (include categorii DEDUSE: ex. meserie via Ion->sofer->meserie)\n";
+        // arata fiecare suprafata care exista in >=2 domenii => noduri distincte
+        map<string,vector<int>> bySurface;
+        for(int i=0;i<(int)tok.word.size();i++) bySurface[tok.surface(i)].push_back(i);
+        bool any=false;
+        for(auto& kv:bySurface) if(kv.second.size()>=2){ any=true;
+            cout<<"  \""<<kv.first<<"\" -> noduri distincte: ";
+            bool f=true; for(int id:kv.second){cout<<(f?"":", ")<<"node#"<<id<<"("<<tok.pretty(id)<<")";f=false;}
+            cout<<"\n";
+        }
+        if(!any) cout<<"  (niciun cuvant nu apare in mai multe domenii in acest corpus)\n";
     }
+
+    cout<<"\n== 7. NEXT-TOKEN PE GRAF — generare DETERMINISTA (logica) ==\n";
+    if(demoActor>=0){
+        auto G=gen.generate(demoActor,8,false);
+        cout<<"  seed auto = '"<<tok.pretty(demoActor)<<"'\n  "<<gen.show(G,rv)<<"\n";
+    } else cout<<"  (niciun actor potrivit)\n";
+    if(codeSeed>=0){
+        auto G=gen.generate(codeSeed,8,false);
+        cout<<"  seed cod  = '"<<tok.pretty(codeSeed)<<"'\n  "<<gen.show(G,rv)<<"\n";
+    }
+
+    cout<<"\n== 8. NEXT-TOKEN PE GRAF — generare CREATIVA (salt prin embedding) ==\n";
+    if(demoConcept>=0){
+        auto G=gen.generate(demoConcept,8,true);
+        cout<<"  seed auto = '"<<tok.pretty(demoConcept)<<"'\n  "<<gen.show(G,rv)<<"\n";
+        cout<<"  (\"~(salt)~>\" = legatura semantica fara muchie fizica)\n";
+    }
+
+    cout<<"\n== 9. AUTO-REWRITE (penalizare muchie -> alta generare) ==\n";
+    if(demoActor>=0){
+        auto G1=gen.generate(demoActor,6,false);
+        cout<<"  inainte: "<<gen.show(G1,rv)<<"\n";
+        if(G1.steps.size()>=2){
+            int a=G1.steps[0].node, b=G1.steps[1].node, r=G1.steps[1].rel;
+            graph.penalize(a,b,r,0.05f);   // muchia aleasa devine "nesigura"
+            cout<<"  penalizez muchia "<<tok.pretty(a)<<" -("<<rv.pattern[r]<<")-> "<<tok.pretty(b)<<" (x0.05)\n";
+            auto G2=gen.generate(demoActor,6,false);
+            cout<<"  dupa:    "<<gen.show(G2,rv)<<"\n";
+        }
+    }
+
+    cout<<"\n== 10. PLANNER-COMPILATOR (drum spre un token virtual) ==\n";
+    if(virtGoal>=0){
+        // alege automat un nod de start care POATE atinge starea virtuala [cod_valid]
+        int planSeed=-1; Chain best;
+        for(int i=0;i<(int)tok.word.size();i++){
+            if(i==virtGoal || tok.isVirtual(i) || !graph.hasOutgoing(i)) continue;
+            Chain p=reason.plan(i,virtGoal,8);
+            if(p.nodes.size()>=2 && (planSeed<0 || p.nodes.size()>best.nodes.size())){ planSeed=i; best=p; }
+        }
+        if(planSeed>=0) cout<<"  plan "<<tok.pretty(planSeed)<<" -> "<<tok.pretty(virtGoal)<<": "<<reason.verbalize(best)<<"\n";
+        else cout<<"  niciun nod nu atinge "<<tok.pretty(virtGoal)<<" (Nu stiu)\n";
+    } else cout<<"  (niciun token virtual in corpus)\n";
+
+    cout<<"\n== 11. RATIONAMENT \"DE CE?\" (cauza -> scop) ==\n";
+    if(demoActor>=0)
+        cout<<"  De ce actioneaza "<<tok.pretty(demoActor)<<"?\n    A: "<<reason.why(demoActor)<<"\n";
 
     cout<<"\n== 12. EXPANDARE prin DEFINITIE ==\n";
-    for(const string& term:{string("meserie"),string("hrana"),string("om")}){
-        int t=tok.get(term); if(t<0)continue;
-        string e=reason.expandDefinition(t);
-        cout<<"  "<<(e.empty()?term+": (fara definitie)":e)<<"\n";
+    for(auto&kv:defs.def){ cout<<"  "<<reason.expandDefinition(kv.first)<<"\n"; }
+
+    cout<<"\n== 13. ANTI-HALUCINATIE ==\n";
+    int dragon=tok.get("dragon"); // token inexistent in corpus
+    cout<<"  Q: generare din 'dragon' (necunoscut)?\n  A: ";
+    if(dragon<0) cout<<"Nu stiu (token absent din graf).\n";
+    else { auto G=gen.generate(dragon,5,false); cout<<gen.show(G,rv)<<"\n"; }
+    if(demoActor>=0){
+        // o relatie inventata, care nu exista in vocabular => Nu stiu
+        cout<<"  Q: raspuns pe o relatie inexistenta ('zboara')?\n  A: ";
+        int r=rv.get("zboara");
+        if(r<0) cout<<"Nu stiu (relatie neobservata).\n";
+        else { auto outs=reason.direct(demoActor,r); cout<<(outs.empty()?"Nu stiu.":"...")<<"\n"; }
     }
-
-    cout<<"\n== 13. ANTI-HALUCINATIE (informatie inexistenta) ==\n";
-    auto answerRel=[&](const string&subj,const string&relPattern){
-        int s=tok.get(subj), r=rv.get(relPattern);
-        if(s<0||r<0){cout<<"  Nu stiu.\n";return;}
-        auto outs=reason.direct(s,r);
-        if(outs.empty()){cout<<"  Nu stiu.\n";return;}
-        string res; for(size_t i=0;i<outs.size();i++)res+=(i?", ":"")+tok.name(outs[i]);
-        cout<<"  "<<subj<<" --["<<relPattern<<"]--> "<<res<<"\n";
-    };
-    cout<<"  Q: unde 'sta' Ion?\n  A: "; answerRel("Ion","sta");
-    cout<<"  Q: ce relatie 'zboara' are pisica?\n  A: "; answerRel("pisica","zboara");
-    int unknown=tok.get("dragon");
-    cout<<"  Q: lant din 'dragon' (token necunoscut)?\n  A: ";
-    if(unknown<0) cout<<"Nu stiu.\n"; else cout<<reason.verbalize(reason.bestChain(unknown,5))<<"\n";
-
     return 0;
 }
