@@ -1,57 +1,31 @@
-# ============================================================================
-#  CUNOSTINTE — digerate de motor prin CITIRE. NU sunt scrise in cod.
-#  Motorul deschide acest fisier (ca un om care citeste un manual), il
-#  abstractizeaza prin regulile distributionale si il transforma in GEOMETRIE
-#  (noduri, ierarhii, vectori) — exact principiul cerut de audit.
-# ----------------------------------------------------------------------------
-#  Sectiuni:  [FACTS]  /  [DEFINITIONS]
-#  Optional pe antet:  @domeniu  => ANCORA CONTEXTUALA (acelasi cuvant in
-#                       domenii diferite devine alt nod; "for"@lang != "for"@code).
-#  Format fapt:        A relatie B
-#  Format definitie:   TERMEN relatie corp...
-#  Tokenii in paranteze drepte, ex. [cod_valid], sunt tokeni VIRTUALI (stari /
-#  intentii structurale), nu cuvinte de suprafata.
-# ============================================================================
+# Fapte — invatate PRIN CITIRE. Sistemul descopera singur relatiile (ca
+# clustere numerice R0,R1..) si conceptele (clustere de noduri), fara ca
+# vreun nume semantic sa apara in cod.
+# Conventie pur structurala (nu semantica): primul token = sursa, ultimul =
+# tinta, restul = suprafata-relatie (din care se calculeaza embedding-ul).
 
-[FACTS]
 Ion este om
-Vasile este om
 Maria este om
+Vasile este om
 pisica este animal
 caine este animal
 sofer este meserie
 mecanic este meserie
+meserie este ocupatie
+
+munca produce bani
+focul produce caldura
+motorul produce putere
+meserie produce bani
+
 Ion lucreaza sofer
 Vasile lucreaza mecanic
-pisica sta masa
-telefon sta birou
-sofer face munca
-munca produce bani
+
 bani cumpara hrana
 hrana sustine om
-meserie produce venit
-venit cumpara hrana
+
 om munceste pentru bani
 om mananca pentru energie
 
-[DEFINITIONS]
-meserie inseamna activitate care aduce bani
-animal inseamna fiinta vie
 om inseamna fiinta vie
-hrana inseamna energie pentru corp
-
-# --- Ancore contextuale: "for" traieste pe doua etaje izolate, fara coliziune
-[FACTS @lang]
-for este cuvant
-
-# --- Mini-domeniu de programare "citit din carte": sintaxa devine geometrie.
-#     Planner-ul poate apoi sa planuiasca un drum spre tokenul virtual [cod_valid].
-[FACTS @code]
-for este instructiune
-int este tip
-sir este tip
-int stocheaza intreg
-variabila stocheaza valoare
-functie contine instructiune
-instructiune termina punctvirgula
-functie produce [cod_valid]
+animal inseamna fiinta vie
