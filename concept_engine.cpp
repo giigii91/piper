@@ -1,49 +1,41 @@
 // ============================================================================
-//  MOTOR NEURO-SIMBOLIC fara reguli semantice hardcodate.
+//  GRAPH-AUGMENTED TRANSFORMER (single file, C++17, fara librarii externe)
 // ----------------------------------------------------------------------------
-//  Cerinta (audit): ZERO decizii de tip if(semantic). Nicaieri in cod nu exista
-//    if(concept) / if(definition) / if(cause) / if(purpose) / if(question type)
-//    / if(word=="este") / if(relation==ceva). Toate deciziile SEMANTICE sunt
-//    inlocuite cu CALCUL: embedding, similaritate, clustering, scor, graf, prag.
+//  Model MIC + memorie externa in GRAF + invatare ONLINE. NU memoreaza lumea
+//  in greutati; o tine in graf. La FIECARE next-token, transformerul consulta
+//  graful inainte sa aleaga tokenul:
 //
-//  Singurele "if"-uri din cod sunt TEHNICE: index valid, vector gol, prag
-//  numeric, comparatie de scoruri, bucle, alocari.
+//    tokens -> Transformer(hidden) -> GraphAttention -> ConceptContext
+//           -> FusionGate -> LogitBias -> NextToken -> update ActiveGraphState
 //
-//  Pipeline:
-//    1. Tokenizer general (numeric, fara semantica).
-//    2. Encoder neuronal -> embeddings de tokeni (next-token, nesupervizat).
-//    3. GraphMemory: noduri + muchii; fiecare muchie are embedding.
-//    4. Relation discovery: muchiile se grupeaza in CLUSTERE numerice R0,R1,...
-//       dupa similaritatea embeddingului de relatie (nu dupa string).
-//    5. Concept discovery: nodurile se grupeaza in concepte C0,C1,... dupa
-//       similaritatea embeddingurilor de nod.
-//    6. Forward-chaining NUMERIC: compune muchii adiacente compatibile vectorial
-//       (nu pe tipuri), genereaza muchii derivate.
-//    7. Reasoning: intrebarea -> embedding -> PATH-SEARCH ponderat in graf.
-//       Scor = relevanta(query,muchie) + confidence. Fara "if de ce".
-//    8. Anti-halucinatie: daca cel mai bun path are scor/relevanta sub prag,
-//       raspunde "Nu stiu". Nu inventeaza.
+//  Idei cheie (toate numerice, fara semantica hardcodata, fara dictionar):
+//   * Embedding-uri TIED + STORE crescator: un cuvant nou = un rand nou de
+//     embedding care intra automat si in logits (head legat). Corpul
+//     transformerului (atentie/ffn) ramane INGHETAT => "fara retraining".
+//   * Tokenizer ADAPTIV: cuvant nou -> token nou + nod nou; embedding initial
+//     din CARACTERE (morfologie) + context + vecini din graf. Niciun <unk>.
+//   * Online learning pe 3 niveluri:
+//       A. lent  = greutatile transformerului (gramatica/structura) [pretrain]
+//       B. rapid = graful (noduri/muchii/relatii/concepte/scopuri)
+//       C. adaptiv = embedding-uri tokeni noi (corp inghetat)
+//   * Concepte = clustere numerice de noduri (C0,C1..). Relatii = clustere
+//     numerice de muchii (R0,R1..). Scopuri = atractori (convergenta in graf).
+//   * Limba noua: cuvinte engleze devin tokeni/noduri noi; prin contexte
+//     similare embeddingurile lor se aliniaza la conceptele existente — fara
+//     dictionar ro-en.
+//   * Anti-halucinatie: un raspuns factual primeste bias doar daca e SUSTINUT
+//     de graf (activare*confidence peste prag). Altfel verdict numeric -> "Nu stiu".
 //
-//  Limita asumata onest ("fara magie falsa"): calitatea clusterelor depinde de
-//  encoderul mic antrenat pe un corpus mic; doua relatii sunt grupate impreuna
-//  doar daca embeddingurile lor ies suficient de apropiate. Nu fortam nimic cu
-//  reguli — daca semnalul vectorial nu e suficient, raman clustere separate.
-//
-//  C++17, single file, fara librarii externe.
 //  Compilare:  g++ -O2 -std=c++17 concept_engine.cpp -o ce
-//  Rulare:     ./ce [knowledge.txt] [questions.txt]
+//  Rulare:     ./ce
 // ============================================================================
 
 #include <iostream>
-#include <fstream>
 #include <vector>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
-#include <set>
 #include <map>
-#include <tuple>
-#include <queue>
+#include <set>
 #include <cmath>
 #include <random>
 #include <algorithm>
@@ -55,29 +47,47 @@ static mt19937 rng(7);
 // ----------------------------------------------------------------------------
 //  Utilitare numerice
 // ----------------------------------------------------------------------------
-vector<string> split(const string& s){
+vector<string> splitw(const string& s){
     vector<string> r; string w;
-    for(char c:s){ if(c==' '||c=='\t'){ if(!w.empty()) r.push_back(w); w.clear(); } else w+=c; }
-    if(!w.empty()) r.push_back(w);
-    return r;
+    for(char c:s){ if(c==' '||c=='\t'){ if(!w.empty())r.push_back(w); w.clear(); } else w+=c; }
+    if(!w.empty()) r.push_back(w); return r;
 }
-string trim(const string& s){
-    size_t a=s.find_first_not_of(" \t\r\n"); if(a==string::npos) return "";
-    size_t b=s.find_last_not_of(" \t\r\n"); return s.substr(a,b-a+1);
+float dotv(const vector<float>&a,const vector<float>&b){ float s=0; for(size_t i=0;i<a.size();i++) s+=a[i]*b[i]; return s; }
+float nrm(const vector<float>&a){ return sqrt(dotv(a,a)+1e-9f); }
+float cosv(const vector<float>&a,const vector<float>&b){ if(a.empty()||b.empty())return 0.f; return dotv(a,b)/(nrm(a)*nrm(b)); }
+float sigm(float x){ return 1.f/(1.f+exp(-x)); }
+vector<float> softmax(vector<float> x){
+    if(x.empty())return x; float m=*max_element(x.begin(),x.end()),s=0;
+    for(float&v:x){v=exp(v-m);s+=v;} for(float&v:x)v/=s; return x;
 }
-float dot(const vector<float>&a,const vector<float>&b){ float s=0; for(size_t i=0;i<a.size();i++) s+=a[i]*b[i]; return s; }
-float norm(const vector<float>&a){ return sqrt(dot(a,a)+1e-9f); }
-float cosSim(const vector<float>&a,const vector<float>&b){
-    if(a.empty()||b.empty()) return 0.f;
-    return dot(a,b)/(norm(a)*norm(b));
-}
-vector<float> vadd(const vector<float>&a,const vector<float>&b){
-    vector<float> r(a.size()); for(size_t i=0;i<a.size();i++) r[i]=a[i]+b[i]; return r;
-}
+float siluf(float x){return x/(1+exp(-x));}
+float dsiluf(float x){float s=1/(1+exp(-x));return s+x*s*(1-s);}
 
 // ============================================================================
-//  ENCODER NEURAL (transformer mic) -> embeddings de tokeni
-//  (next-token nesupervizat; nicio eticheta semantica).
+//  EMBEDDING STORE crescator, cu head TIED (logit = hidden . emb[token]).
+//  Adaugarea unui token nou = un rand nou; intra automat in input si in logits.
+//  Adam per-rand pentru update online doar pe randurile atinse.
+// ============================================================================
+struct EmbeddingStore {
+    int D;
+    vector<vector<float>> E, gM, gV, grad;
+    EmbeddingStore(int d=0):D(d){}
+    int add(const vector<float>& init){
+        E.push_back(init); gM.push_back(vector<float>(D,0)); gV.push_back(vector<float>(D,0));
+        grad.push_back(vector<float>(D,0)); return (int)E.size()-1;
+    }
+    int size()const{ return (int)E.size(); }
+    void zerograd(){ for(auto& r:grad) fill(r.begin(),r.end(),0); }
+    void stepRows(float lr,float t,float wd,const set<int>& rows){
+        const float b1=0.9f,b2=0.999f,eps=1e-8f; float bc1=1-pow(b1,t),bc2=1-pow(b2,t);
+        for(int i:rows){ for(int k=0;k<D;k++){
+            float g=grad[i][k]; gM[i][k]=b1*gM[i][k]+(1-b1)*g; gV[i][k]=b2*gV[i][k]+(1-b2)*g*g;
+            E[i][k]-=lr*(gM[i][k]/bc1/(sqrt(gV[i][k]/bc2)+eps)+wd*E[i][k]); } }
+    }
+};
+
+// ============================================================================
+//  Matrice cu Adam (pentru corpul transformerului)
 // ============================================================================
 struct Mat {
     int R,C; vector<float> w,g,m,v;
@@ -87,39 +97,24 @@ struct Mat {
     float& gat(int i,int j){return g[i*C+j];}
     void zerograd(){ fill(g.begin(),g.end(),0);}
     void step(float lr,float t,float wd){
-        const float b1=0.9f,b2=0.999f,eps=1e-8f;
-        float bc1=1-pow(b1,t),bc2=1-pow(b2,t);
-        for(size_t i=0;i<w.size();i++){
-            m[i]=b1*m[i]+(1-b1)*g[i]; v[i]=b2*v[i]+(1-b2)*g[i]*g[i];
-            w[i]-=lr*(m[i]/bc1/(sqrt(v[i]/bc2)+eps)+wd*w[i]);
-        }
+        const float b1=0.9f,b2=0.999f,eps=1e-8f; float bc1=1-pow(b1,t),bc2=1-pow(b2,t);
+        for(size_t i=0;i<w.size();i++){ m[i]=b1*m[i]+(1-b1)*g[i]; v[i]=b2*v[i]+(1-b2)*g[i]*g[i];
+            w[i]-=lr*(m[i]/bc1/(sqrt(v[i]/bc2)+eps)+wd*w[i]); }
     }
 };
 vector<float> matmul(const vector<float>&x,Mat&W){
-    vector<float> y(W.C,0);
-    for(int i=0;i<W.R;i++){ float xi=x[i]; if(xi==0)continue;
-        for(int j=0;j<W.C;j++) y[j]+=xi*W.at(i,j); }
-    return y;
+    vector<float> y(W.C,0); for(int i=0;i<W.R;i++){ float xi=x[i]; if(xi==0)continue;
+        for(int j=0;j<W.C;j++) y[j]+=xi*W.at(i,j);} return y;
 }
 vector<float> matmul_bwd(const vector<float>&x,const vector<float>&dy,Mat&W){
-    vector<float> dx(W.R,0);
-    for(int i=0;i<W.R;i++){ float a=0,xi=x[i];
-        for(int j=0;j<W.C;j++){ W.gat(i,j)+=xi*dy[j]; a+=W.at(i,j)*dy[j]; }
-        dx[i]=a; }
-    return dx;
+    vector<float> dx(W.R,0); for(int i=0;i<W.R;i++){ float a=0,xi=x[i];
+        for(int j=0;j<W.C;j++){ W.gat(i,j)+=xi*dy[j]; a+=W.at(i,j)*dy[j]; } dx[i]=a; } return dx;
 }
-vector<float> softmax(vector<float> x){
-    float m=*max_element(x.begin(),x.end()),s=0;
-    for(float&v:x){v=exp(v-m);s+=v;} for(float&v:x)v/=s; return x;
-}
-float silu(float x){return x/(1+exp(-x));}
-float dsilu(float x){float s=1/(1+exp(-x));return s+x*s*(1-s);}
 struct RMSNorm {
     int D; Mat g; RMSNorm(){} RMSNorm(int d):D(d),g(1,d){for(int i=0;i<d;i++)g.at(0,i)=1;}
     vector<float> fwd(const vector<float>&x,float&inv,vector<float>&xn){
         float ms=0; for(float v:x)ms+=v*v; ms/=D; inv=1/sqrt(ms+1e-5f);
-        xn.resize(D); vector<float> y(D);
-        for(int i=0;i<D;i++){xn[i]=x[i]*inv;y[i]=xn[i]*g.at(0,i);} return y;
+        xn.resize(D); vector<float> y(D); for(int i=0;i<D;i++){xn[i]=x[i]*inv;y[i]=xn[i]*g.at(0,i);} return y;
     }
     vector<float> bwd(const vector<float>&dy,const vector<float>&xn,float inv){
         vector<float> dxn(D); float d=0;
@@ -127,528 +122,392 @@ struct RMSNorm {
         vector<float> dx(D); for(int i=0;i<D;i++)dx[i]=inv*(dxn[i]-xn[i]*d/D); return dx;
     }
 };
-struct Encoder {
-    int V,T,D,H,nH,hd;
-    Mat tokEmb,Wq,Wk,Wv,Wo,W1,Wg,W2,head; RMSNorm n1,n2,nf;
-    Encoder(int v,int t,int d,int ffn,int heads)
-        :V(v),T(t),D(d),H(ffn),nH(heads),hd(d/heads),
-         tokEmb(v,d),Wq(d,d),Wk(d,d),Wv(d,d),Wo(d,d),
-         W1(d,ffn),Wg(d,ffn),W2(ffn,d),head(d,v),n1(d),n2(d),nf(d){
+
+// ============================================================================
+//  TRANSFORMER (1 bloc) cu embedding-uri TIED din EmbeddingStore.
+//  Corpul (Wq..W2, norme) e "invatarea lenta". Embeddingurile sunt in store
+//  si pot fi actualizate separat (invatare adaptiva), cu corpul inghetat.
+// ============================================================================
+struct Transformer {
+    int D,H,nH,hd; EmbeddingStore* es;
+    Mat Wq,Wk,Wv,Wo,W1,Wg,W2; RMSNorm n1,n2,nf;
+    Transformer(EmbeddingStore* store,int d,int ffn,int heads)
+        :D(d),H(ffn),nH(heads),hd(d/heads),es(store),
+         Wq(d,d),Wk(d,d),Wv(d,d),Wo(d,d),W1(d,ffn),Wg(d,ffn),W2(ffn,d),n1(d),n2(d),nf(d){
         float s=sqrt(2.0f/d);
-        tokEmb.init(0.02f);Wq.init(s);Wk.init(s);Wv.init(s);Wo.init(s);
-        W1.init(s);Wg.init(s);W2.init(sqrt(2.0f/ffn));head.init(0.02f);
+        Wq.init(s);Wk.init(s);Wv.init(s);Wo.init(s);W1.init(s);Wg.init(s);W2.init(sqrt(2.0f/ffn));
     }
-    vector<Mat*> params(){return{&tokEmb,&Wq,&Wk,&Wv,&Wo,&W1,&Wg,&W2,&head,&n1.g,&n2.g,&nf.g};}
-    void zerograd(){for(auto*p:params())p->zerograd();}
-    void step(float lr,float t,float wd){for(auto*p:params())p->step(lr,t,wd);}
-    struct Cache{
-        vector<int> ids; int n;
+    vector<Mat*> body(){ return {&Wq,&Wk,&Wv,&Wo,&W1,&Wg,&W2,&n1.g,&n2.g,&nf.g}; }
+    void zerogradBody(){ for(auto*p:body())p->zerograd(); }
+    void stepBody(float lr,float t,float wd){ for(auto*p:body())p->step(lr,t,wd); }
+
+    struct Cache{ vector<int> ids; int n;
         vector<vector<float>> emb,a_n,res1,f_n,up,gate,act,ffn,out,hid;
         vector<float> a_inv,f_inv,nf_inv; vector<vector<float>> a_xn,f_xn,nf_xn;
-        vector<vector<float>> q,k,vv,attn; vector<vector<float>> probs;
-    };
+        vector<vector<float>> q,k,vv,attn; vector<vector<float>> probs; };
+
     Cache forward(const vector<int>&ids){
         Cache c; c.ids=ids; int n=ids.size(); c.n=n;
         c.emb.assign(n,vector<float>(D));
-        for(int t=0;t<n;t++)for(int i=0;i<D;i++)c.emb[t][i]=tokEmb.at(ids[t],i);
-        c.a_n.resize(n);c.a_inv.resize(n);c.a_xn.resize(n);
-        c.q.resize(n);c.k.resize(n);c.vv.resize(n);
-        for(int t=0;t<n;t++){
-            float inv;vector<float> xn; c.a_n[t]=n1.fwd(c.emb[t],inv,xn);
+        for(int t=0;t<n;t++) c.emb[t]=es->E[ids[t]];
+        c.a_n.resize(n);c.a_inv.resize(n);c.a_xn.resize(n);c.q.resize(n);c.k.resize(n);c.vv.resize(n);
+        for(int t=0;t<n;t++){ float inv;vector<float> xn; c.a_n[t]=n1.fwd(c.emb[t],inv,xn);
             c.a_inv[t]=inv;c.a_xn[t]=xn;
-            c.q[t]=matmul(c.a_n[t],Wq);c.k[t]=matmul(c.a_n[t],Wk);c.vv[t]=matmul(c.a_n[t],Wv);
-        }
-        c.attn.assign(n,vector<float>(D,0)); c.probs.resize(nH*n);
-        float invs=1/sqrt((float)hd);
-        for(int h=0;h<nH;h++)for(int t=0;t<n;t++){
-            vector<float> sc(t+1);
+            c.q[t]=matmul(c.a_n[t],Wq);c.k[t]=matmul(c.a_n[t],Wk);c.vv[t]=matmul(c.a_n[t],Wv); }
+        c.attn.assign(n,vector<float>(D,0)); c.probs.resize(nH*n); float invs=1/sqrt((float)hd);
+        for(int h=0;h<nH;h++)for(int t=0;t<n;t++){ vector<float> sc(t+1);
             for(int j=0;j<=t;j++){float s=0;for(int i=0;i<hd;i++)s+=c.q[t][h*hd+i]*c.k[j][h*hd+i];sc[j]=s*invs;}
             auto p=softmax(sc); c.probs[h*n+t]=p;
-            for(int j=0;j<=t;j++)for(int i=0;i<hd;i++)c.attn[t][h*hd+i]+=p[j]*c.vv[j][h*hd+i];
-        }
+            for(int j=0;j<=t;j++)for(int i=0;i<hd;i++)c.attn[t][h*hd+i]+=p[j]*c.vv[j][h*hd+i]; }
         c.res1.assign(n,vector<float>(D));
         for(int t=0;t<n;t++){auto o=matmul(c.attn[t],Wo);for(int i=0;i<D;i++)c.res1[t][i]=c.emb[t][i]+o[i];}
-        c.f_n.resize(n);c.f_inv.resize(n);c.f_xn.resize(n);
-        c.up.resize(n);c.gate.resize(n);c.act.resize(n);c.ffn.resize(n);
+        c.f_n.resize(n);c.f_inv.resize(n);c.f_xn.resize(n);c.up.resize(n);c.gate.resize(n);c.act.resize(n);c.ffn.resize(n);
         c.out.assign(n,vector<float>(D));
-        for(int t=0;t<n;t++){
-            float inv;vector<float> xn;c.f_n[t]=n2.fwd(c.res1[t],inv,xn);c.f_inv[t]=inv;c.f_xn[t]=xn;
+        for(int t=0;t<n;t++){ float inv;vector<float> xn;c.f_n[t]=n2.fwd(c.res1[t],inv,xn);c.f_inv[t]=inv;c.f_xn[t]=xn;
             c.up[t]=matmul(c.f_n[t],W1);c.gate[t]=matmul(c.f_n[t],Wg);
-            c.act[t].resize(H);for(int i=0;i<H;i++)c.act[t][i]=silu(c.up[t][i])*c.gate[t][i];
-            c.ffn[t]=matmul(c.act[t],W2);
-            for(int i=0;i<D;i++)c.out[t][i]=c.res1[t][i]+c.ffn[t][i];
-        }
+            c.act[t].resize(H);for(int i=0;i<H;i++)c.act[t][i]=siluf(c.up[t][i])*c.gate[t][i];
+            c.ffn[t]=matmul(c.act[t],W2); for(int i=0;i<D;i++)c.out[t][i]=c.res1[t][i]+c.ffn[t][i]; }
         c.hid.resize(n);c.nf_inv.resize(n);c.nf_xn.resize(n);
         for(int t=0;t<n;t++){float inv;vector<float> xn;c.hid[t]=nf.fwd(c.out[t],inv,xn);c.nf_inv[t]=inv;c.nf_xn[t]=xn;}
         return c;
     }
-    vector<float> logits(const vector<float>&h){return matmul(h,head);}
-    float trainSeq(const vector<int>&ids){
-        int n=ids.size(); if(n<2) return 0; Cache c=forward(ids);
-        vector<vector<float>> dHid(n,vector<float>(D,0));
-        float loss=0;int cnt=0;
+    // logits TIED peste TOT vocabularul curent
+    vector<float> logits(const vector<float>&h){
+        int V=es->size(); vector<float> z(V,0);
+        for(int v=0;v<V;v++) z[v]=dotv(h,es->E[v]); return z;
+    }
+    vector<float> hiddenLast(const vector<int>&ids){ if(ids.empty())return vector<float>(D,0); return forward(ids).hid.back(); }
+
+    // un pas de antrenare next-token. updateBody=false => doar embeddingurile
+    // se misca (invatare adaptiva, corp inghetat). Returneaza loss.
+    float trainSeq(const vector<int>&ids, bool updateBody, float lr, float wd, float& step){
+        int n=ids.size(); if(n<2) return 0; Cache c=forward(ids); int V=es->size();
+        set<int> touched;
+        vector<vector<float>> dHid(n,vector<float>(D,0)); float loss=0;int cnt=0;
         for(int t=0;t<n-1;t++){
             auto z=logits(c.hid[t]); auto p=softmax(z); int tg=ids[t+1];
-            loss+=-log(max(p[tg],1e-9f));cnt++;
-            vector<float> dz=p;dz[tg]-=1; dHid[t]=matmul_bwd(c.hid[t],dz,head);
+            loss+=-log(max(p[tg],1e-9f)); cnt++;
+            vector<float> dz=p; dz[tg]-=1;
+            // grad spre hidden (head tied) + grad spre randuri de embedding
+            for(int v=0;v<V;v++){ float d=dz[v]; if(d==0)continue;
+                for(int i=0;i<D;i++){ dHid[t][i]+=d*es->E[v][i]; es->grad[v][i]+=d*c.hid[t][i]; }
+                touched.insert(v); }
         }
         vector<vector<float>> dOut(n,vector<float>(D,0));
         for(int t=0;t<n-1;t++) dOut[t]=nf.bwd(dHid[t],c.nf_xn[t],c.nf_inv[t]);
         vector<vector<float>> dRes1(n,vector<float>(D,0));
-        for(int t=0;t<n;t++){
-            for(int i=0;i<D;i++)dRes1[t][i]+=dOut[t][i];
-            vector<float> dact=matmul_bwd(c.act[t],dOut[t],W2);
-            vector<float> dup(H),dg(H);
-            for(int i=0;i<H;i++){float su=silu(c.up[t][i]);dg[i]=dact[i]*su;dup[i]=dact[i]*c.gate[t][i]*dsilu(c.up[t][i]);}
+        for(int t=0;t<n;t++){ for(int i=0;i<D;i++)dRes1[t][i]+=dOut[t][i];
+            vector<float> dact=matmul_bwd(c.act[t],dOut[t],W2); vector<float> dup(H),dg(H);
+            for(int i=0;i<H;i++){float su=siluf(c.up[t][i]);dg[i]=dact[i]*su;dup[i]=dact[i]*c.gate[t][i]*dsiluf(c.up[t][i]);}
             vector<float> d1=matmul_bwd(c.f_n[t],dup,W1),d2=matmul_bwd(c.f_n[t],dg,Wg);
             vector<float> df(D);for(int i=0;i<D;i++)df[i]=d1[i]+d2[i];
-            vector<float> dr=n2.bwd(df,c.f_xn[t],c.f_inv[t]);
-            for(int i=0;i<D;i++)dRes1[t][i]+=dr[i];
-        }
+            vector<float> dr=n2.bwd(df,c.f_xn[t],c.f_inv[t]); for(int i=0;i<D;i++)dRes1[t][i]+=dr[i]; }
         vector<vector<float>> dEmb(n,vector<float>(D,0)),dAttn(n,vector<float>(D,0));
         for(int t=0;t<n;t++){ for(int i=0;i<D;i++)dEmb[t][i]+=dRes1[t][i]; dAttn[t]=matmul_bwd(c.attn[t],dRes1[t],Wo); }
         vector<vector<float>> dq(n,vector<float>(D,0)),dk(n,vector<float>(D,0)),dv(n,vector<float>(D,0));
         float invs=1/sqrt((float)hd);
-        for(int h=0;h<nH;h++)for(int t=0;t<n;t++){
-            int L=t+1; auto&p=c.probs[h*n+t]; vector<float> dp(L,0);
+        for(int h=0;h<nH;h++)for(int t=0;t<n;t++){ int L=t+1; auto&p=c.probs[h*n+t]; vector<float> dp(L,0);
             for(int j=0;j<L;j++){float dd=0;for(int i=0;i<hd;i++){dv[j][h*hd+i]+=p[j]*dAttn[t][h*hd+i];dd+=dAttn[t][h*hd+i]*c.vv[j][h*hd+i];}dp[j]=dd;}
             float dotp=0;for(int j=0;j<L;j++)dotp+=dp[j]*p[j];
             for(int j=0;j<L;j++){float ds=p[j]*(dp[j]-dotp)*invs;
-                for(int i=0;i<hd;i++){dq[t][h*hd+i]+=ds*c.k[j][h*hd+i];dk[j][h*hd+i]+=ds*c.q[t][h*hd+i];}}
-        }
-        for(int t=0;t<n;t++){
-            vector<float> a=matmul_bwd(c.a_n[t],dq[t],Wq),b=matmul_bwd(c.a_n[t],dk[t],Wk),cc=matmul_bwd(c.a_n[t],dv[t],Wv);
+                for(int i=0;i<hd;i++){dq[t][h*hd+i]+=ds*c.k[j][h*hd+i];dk[j][h*hd+i]+=ds*c.q[t][h*hd+i];}} }
+        for(int t=0;t<n;t++){ vector<float> a=matmul_bwd(c.a_n[t],dq[t],Wq),b=matmul_bwd(c.a_n[t],dk[t],Wk),cc=matmul_bwd(c.a_n[t],dv[t],Wv);
             vector<float> dn(D);for(int i=0;i<D;i++)dn[i]=a[i]+b[i]+cc[i];
-            vector<float> de=n1.bwd(dn,c.a_xn[t],c.a_inv[t]);
-            for(int i=0;i<D;i++)dEmb[t][i]+=de[i];
-        }
-        for(int t=0;t<n;t++)for(int i=0;i<D;i++)tokEmb.gat(ids[t],i)+=dEmb[t][i];
+            vector<float> de=n1.bwd(dn,c.a_xn[t],c.a_inv[t]); for(int i=0;i<D;i++)dEmb[t][i]+=de[i]; }
+        for(int t=0;t<n;t++){ for(int i=0;i<D;i++) es->grad[ids[t]][i]+=dEmb[t][i]; touched.insert(ids[t]); }
+        step+=1;
+        es->stepRows(lr,step,wd,touched);
+        if(updateBody) stepBody(lr,step,1e-3f);
+        zerogradBody(); es->zerograd();
         return cnt?loss/cnt:0;
     }
-    vector<float> tokenVec(int id){vector<float> v(D);for(int i=0;i<D;i++)v[i]=tokEmb.at(id,i);return v;}
-    // distributie de next-token pe vocabular dat un context (PREDICTIE)
-    vector<float> nextDist(const vector<int>& ctx){
-        if(ctx.empty()) return vector<float>(V,1.0f/V);
-        Cache c=forward(ctx); return softmax(logits(c.hid.back()));
+};
+
+// ============================================================================
+//  TOKENIZER ADAPTIV — nu pierde cuvinte in <unk>. Cuvant nou => token nou,
+//  cu embedding initial din CARACTERE (morfologie). Returneaza daca e nou.
+// ============================================================================
+struct AdaptiveTokenizer {
+    unordered_map<string,int> id; vector<string> word; EmbeddingStore* es; int D;
+    vector<vector<float>> charBasis;  // baza fixa pe octet -> vector D
+    AdaptiveTokenizer(EmbeddingStore* store,int d):es(store),D(d){
+        charBasis.assign(256,vector<float>(D));
+        normal_distribution<float> g(0,1);
+        for(int c=0;c<256;c++){ for(int k=0;k<D;k++)charBasis[c][k]=g(rng); }
     }
-    // cat de tare prezice contextul 'ctx' tokenul 'tgt' (semnal cauzal/predictiv)
-    float predProb(const vector<int>& ctx,int tgt){
-        auto d=nextDist(ctx); return (tgt>=0&&tgt<(int)d.size())? d[tgt] : 0.f;
-    }
-    // embedding al unei secvente = media embeddingurilor tokenilor (numeric)
-    vector<float> meanVec(const vector<int>& ids,int a,int b){
-        vector<float> v(D,0); int c=0;
-        for(int i=a;i<b && i<(int)ids.size();i++){ if(i<0)continue; auto t=tokenVec(ids[i]); for(int k=0;k<D;k++)v[k]+=t[k]; c++; }
-        if(c>0) for(float&x:v)x/=c;
+    // embedding morfologic: suma vectorilor de caracter + un termen pe bigrame
+    vector<float> charEmbed(const string& w){
+        vector<float> v(D,0);
+        for(unsigned char c:w) for(int k=0;k<D;k++) v[k]+=charBasis[c][k];
+        for(size_t i=0;i+1<w.size();i++){ unsigned char a=w[i],b=w[i+1]; int hsh=(a*131+b)&255;
+            for(int k=0;k<D;k++) v[k]+=0.5f*charBasis[hsh][k]; }
+        float s=nrm(v); for(float&x:v)x/=s; for(float&x:v)x*=0.1f; // scara mica
         return v;
     }
+    int get(const string& w)const{ auto it=id.find(w); return it==id.end()?-1:it->second; }
+    // intoarce id; daca e nou il creeaza (token + embedding initial din caractere)
+    int obtain(const string& w, bool& isNew){
+        auto it=id.find(w); if(it!=id.end()){ isNew=false; return it->second; }
+        isNew=true; int x=es->add(charEmbed(w)); id[w]=x;
+        if((int)word.size()<=x) word.resize(x+1); word[x]=w; return x;
+    }
+    string name(int i)const{ return (i>=0&&i<(int)word.size())?word[i]:"?"; }
 };
 
 // ============================================================================
-//  TOKENIZER general (doar id-uri numerice)
-// ============================================================================
-struct Tokenizer {
-    unordered_map<string,int> id; vector<string> word;
-    int add(const string&s){auto it=id.find(s);if(it!=id.end())return it->second;
-        int x=word.size();id[s]=x;word.push_back(s);return x;}
-    int get(const string&s)const{auto it=id.find(s);return it==id.end()?-1:it->second;}
-    vector<int> enc(const string&s){vector<int> r;for(auto&w:split(s))r.push_back(add(w));return r;}
-    string name(int id)const{return (id>=0&&id<(int)word.size())?word[id]:"?";}
-};
-
-// ============================================================================
-//  CLUSTERER GENERIC (greedy, prag cosinus) — emergent, fara nume
-//  Folosit identic pentru RELATII (pe embedding de relatie) si pentru
-//  CONCEPTE (pe embedding de nod). Returneaza id-uri numerice 0,1,2,...
+//  CLUSTERER greedy (concept/relatie) — id-uri numerice emergente
 // ============================================================================
 struct Clusterer {
-    float thresh;
-    vector<vector<float>> centroid; vector<int> count;
+    float thresh; vector<vector<float>> centroid; vector<int> count;
     Clusterer(float t):thresh(t){}
     int assign(const vector<float>& v){
         int best=-1; float bs=thresh;
-        for(size_t i=0;i<centroid.size();i++){ float s=cosSim(v,centroid[i]); if(s>bs){bs=s;best=(int)i;} }
+        for(size_t i=0;i<centroid.size();i++){float s=cosv(v,centroid[i]); if(s>bs){bs=s;best=(int)i;}}
         if(best<0){ centroid.push_back(v); count.push_back(1); return (int)centroid.size()-1; }
         for(size_t k=0;k<v.size();k++) centroid[best][k]=(centroid[best][k]*count[best]+v[k])/(count[best]+1);
         count[best]++; return best;
     }
-    int nearest(const vector<float>& v)const{   // doar citire, fara a crea cluster
-        int best=-1; float bs=-2;
-        for(size_t i=0;i<centroid.size();i++){ float s=cosSim(v,centroid[i]); if(s>bs){bs=s;best=(int)i;} }
-        return best;
-    }
 };
 
 // ============================================================================
-//  GRAPH MEMORY — noduri + muchii cu embedding
+//  GRAPH MEMORY (noduri=tokeni, muchii cu embedding + confidence + relCluster)
 // ============================================================================
-struct Edge {
-    int src,dst;            // node ids (token ids)
-    int relCluster;         // R0,R1,... (emergent, numeric)
-    float confidence;
-    vector<float> emb;      // embedding-ul propozitiei-sursa (nod+relatie+nod)
-    bool derived;           // creata prin forward-chaining numeric
-    int sentence;           // index propozitie sursa (pentru debug)
-};
+struct Edge { int src,dst,relCluster; float confidence; vector<float> emb; };
 struct GraphMemory {
-    vector<Edge> edges;
-    unordered_map<int,vector<int>> outAdj;
-    set<int> nodes;
-    int addEdge(const Edge& e){
-        for(int ei:outAdj[e.src]) if(edges[ei].dst==e.dst && edges[ei].relCluster==e.relCluster){
-            if(e.confidence>edges[ei].confidence) edges[ei].confidence=e.confidence; return ei; }
-        int idx=edges.size(); edges.push_back(e); outAdj[e.src].push_back(idx);
-        nodes.insert(e.src); nodes.insert(e.dst); return idx;
+    vector<Edge> edges; unordered_map<int,vector<int>> outAdj, inAdj; set<int> nodes;
+    int addEdge(int s,int d,int rel,float conf,const vector<float>& emb){
+        for(int ei:outAdj[s]) if(edges[ei].dst==d&&edges[ei].relCluster==rel){
+            edges[ei].confidence=min(1.f,edges[ei].confidence+0.03f); return ei; }
+        int idx=edges.size(); edges.push_back({s,d,rel,conf,emb});
+        outAdj[s].push_back(idx); inAdj[d].push_back(idx); nodes.insert(s); nodes.insert(d); return idx;
     }
-    vector<int> outIdx(int src)const{ auto it=outAdj.find(src); return it==outAdj.end()?vector<int>{}:it->second; }
+    vector<int> out(int s)const{ auto it=outAdj.find(s); return it==outAdj.end()?vector<int>{}:it->second; }
     bool isNode(int id)const{ return nodes.count(id)>0; }
 };
 
 // ============================================================================
-//  MAIN
+//  ACTIVE GRAPH STATE — noduri active in timpul generarii; update incremental
+//  cu decay + spreading + reinforcement (fara recalcul global).
 // ============================================================================
-int main(int argc,char** argv){
-    string kpath = argc>1? argv[1] : "knowledge.txt";
-    string qpath = argc>2? argv[2] : "questions.txt";
-
-    // ---- citeste corpusul (fapte) si intrebarile ----
-    auto readLines=[&](const string& path)->vector<string>{
-        vector<string> out; ifstream f(path); string line;
-        while(getline(f,line)){ line=trim(line); if(line.empty()||line[0]=='#') continue; out.push_back(line); }
-        return out;
-    };
-    vector<string> factLines=readLines(kpath), qLines=readLines(qpath);
-    if(factLines.empty()){ cout<<"(corpus gol: "<<kpath<<")\n"; return 0; }
-    cout<<"== Corpus: "<<factLines.size()<<" fapte din \""<<kpath<<"\", "
-        <<qLines.size()<<" intrebari din \""<<qpath<<"\" ==\n";
-
-    // ---- tokenizare (fapte + intrebari => vocabular) ----
-    Tokenizer tok;
-    vector<vector<int>> factIds, qIds, trainCorpus;
-    for(auto& s:factLines){ auto v=tok.enc(s); factIds.push_back(v); trainCorpus.push_back(v); }
-    for(auto& s:qLines){ auto v=tok.enc(s); qIds.push_back(v); trainCorpus.push_back(v); }
-
-    // ---- antreneaza encoderul (embeddings nesupervizate) ----
-    Encoder enc(tok.word.size(), 24, 32, 64, 4);
-    cout<<"== Antrenez encoderul (embeddings) ==\n";
-    float lr=0.003f,wd=0.001f,step=0;
-    for(int ep=0;ep<250;ep++){
-        float tot=0;int cc=0;
-        vector<int> ord(trainCorpus.size()); for(int i=0;i<(int)ord.size();i++)ord[i]=i;
-        shuffle(ord.begin(),ord.end(),rng);
-        for(int idx:ord){enc.zerograd();tot+=enc.trainSeq(trainCorpus[idx]);step++;enc.step(lr,step,wd);cc++;}
-        if(ep%50==0)cout<<"  epoch "<<ep<<"  loss "<<tot/cc<<"\n";
+struct ActiveGraphState {
+    map<int,float> act;
+    void seed(const vector<int>& ns,float v=1.f){ for(int n:ns) act[n]=max(act[n],v); }
+    void decay(float d=0.85f){ for(auto& kv:act) kv.second*=d; }
+    void spread(const GraphMemory& g,float rate=0.4f){
+        map<int,float> add;
+        for(auto& kv:act){ if(kv.second<0.05f)continue;
+            for(int ei:g.out(kv.first)){ const Edge& e=g.edges[ei];
+                add[e.dst]+=rate*kv.second*e.confidence; } }
+        for(auto& kv:add) act[kv.first]+=kv.second;
+        // normalizare lina
+        float mx=0; for(auto&kv:act)mx=max(mx,kv.second); if(mx>1) for(auto&kv:act)kv.second/=mx;
     }
-    cout<<"Done.\n\n";
+    void reinforce(int node,float v=0.5f){ act[node]+=v; }
+    vector<pair<int,float>> topk(int k)const{
+        vector<pair<int,float>> v(act.begin(),act.end());
+        sort(v.begin(),v.end(),[](auto&a,auto&b){return a.second>b.second;});
+        if((int)v.size()>k)v.resize(k); return v;
+    }
+};
 
-    // ---- embedding de relatie (suprafata) si de muchie (intreaga propozitie)
-    auto relEmbOf=[&](const vector<int>& ids)->vector<float>{
-        // suprafata-relatie = tokenii dintre primul si ultimul; daca lipsesc,
-        // foloseste media intregii propozitii (decizie pur structurala).
-        int n=ids.size();
-        if(n>=3) return enc.meanVec(ids,1,n-1);
-        return enc.meanVec(ids,0,n);
-    };
-    auto edgeEmbOf=[&](const vector<int>& ids)->vector<float>{ return enc.meanVec(ids,0,ids.size()); };
+// ----------------------------------------------------------------------------
+//  helper afisare
+// ----------------------------------------------------------------------------
+struct Engine; // fwd
 
-    // ============================================================
-    //  RELATION DISCOVERY prin CLUSTERING (R0,R1,...)
-    // ============================================================
+int main(){
+    const int D=32, FFN=64, HEADS=4;
+    EmbeddingStore store(D);
+    AdaptiveTokenizer tok(&store,D);
+    Transformer T(&store,D,FFN,HEADS);
     GraphMemory graph;
-    Clusterer relClust(0.55f);   // prag cosinus pe embedding de relatie
-    vector<int> sentRel(factIds.size(),-1);
-    for(size_t s=0;s<factIds.size();s++){
-        auto& ids=factIds[s];
-        if((int)ids.size()<2) continue;             // tehnic: nevoie de >=2 tokeni
-        int src=ids.front(), dst=ids.back();
-        vector<float> remb=relEmbOf(ids);
+    Clusterer relClust(0.55f), conClust(0.42f);
+    map<int,int> nodeConcept;
+
+    // ---- helpers de invatare ----
+    auto meanVec=[&](const vector<int>& ids,int a,int b){ vector<float> v(D,0); int c=0;
+        for(int i=a;i<b&&i<(int)ids.size();i++){ if(i<0)continue; for(int k=0;k<D;k++)v[k]+=store.E[ids[i]][k]; c++; }
+        if(c)for(float&x:v)x/=c; return v; };
+
+    // tokenizare adaptiva a unei propozitii; raporteaza tokenii noi
+    auto tokenize=[&](const string& s, vector<string>& newWords){
+        vector<int> ids; for(auto& w:splitw(s)){ bool isNew; int t=tok.obtain(w,isNew);
+            if(isNew) newWords.push_back(w); ids.push_back(t);} return ids; };
+
+    // ABSORBI o propozitie in graf (invatare RAPIDA: noduri/muchii/relatii/concepte)
+    auto absorbSentence=[&](const vector<int>& ids){
+        if((int)ids.size()<2) return;
+        int s=ids.front(), d=ids.back();
+        vector<float> remb = ids.size()>=3? meanVec(ids,1,ids.size()-1) : meanVec(ids,0,ids.size());
         int rc=relClust.assign(remb);
-        sentRel[s]=rc;
-        Edge e; e.src=src; e.dst=dst; e.relCluster=rc; e.confidence=0.95f;
-        e.emb=edgeEmbOf(ids); e.derived=false; e.sentence=(int)s;
-        graph.addEdge(e);
-    }
-
-    // ============================================================
-    //  CONCEPT DISCOVERY prin CLUSTERING al embeddingurilor de nod
-    // ============================================================
-    Clusterer conClust(0.38f);
-    map<int,int> nodeConcept;                       // node -> concept id
-    vector<int> nodeList(graph.nodes.begin(),graph.nodes.end());
-    sort(nodeList.begin(),nodeList.end());
-    for(int nd:nodeList) nodeConcept[nd]=conClust.assign(enc.tokenVec(nd));
-
-    // ============================================================
-    //  FORWARD-CHAINING NUMERIC: compune muchii adiacente compatibile
-    //  vectorial (sim intre embeddingurile lor >= prag). Fara tipuri.
-    // ============================================================
-    {
-        float compat=0.62f, decay=0.9f; int base=graph.edges.size();
-        for(int i=0;i<base;i++){
-            Edge A=graph.edges[i];
-            for(int j:graph.outIdx(A.dst)){
-                Edge B=graph.edges[j];
-                if(B.dst==A.src) continue;                  // tehnic: evita bucla
-                if(cosSim(A.emb,B.emb) < compat) continue;  // prag numeric, nu tip
-                Edge e; e.src=A.src; e.dst=B.dst;
-                e.emb=vadd(A.emb,B.emb); for(float&x:e.emb)x*=0.5f;
-                e.relCluster=relClust.nearest(relEmbOf({A.src,B.dst})); // re-clusterizeaza numeric
-                if(e.relCluster<0) e.relCluster=A.relCluster;
-                e.confidence=A.confidence*B.confidence*decay; e.derived=true; e.sentence=-1;
-                graph.addEdge(e);
-            }
-        }
-    }
-
-    // ================== DEBUG / DESCOPERIRI ==================
-    cout<<"== 1. RELATII descoperite (clustere numerice) ==\n";
-    {
-        map<int,vector<int>> byRel;
-        for(size_t s=0;s<sentRel.size();s++) if(sentRel[s]>=0) byRel[sentRel[s]].push_back((int)s);
-        for(auto& kv:byRel){
-            cout<<"  R"<<kv.first<<"  (propozitii: "<<kv.second.size()<<")\n";
-            for(int s:kv.second) cout<<"       \""<<factLines[s]<<"\"\n";
-        }
-    }
-
-    cout<<"\n== 2. CONCEPTE descoperite (clustere de noduri) ==\n";
-    {
-        map<int,vector<int>> byCon;
-        for(auto& kv:nodeConcept) byCon[kv.second].push_back(kv.first);
-        for(auto& kv:byCon){
-            cout<<"  C"<<kv.first<<":  ";
-            bool f=true; for(int nd:kv.second){cout<<(f?"":", ")<<tok.name(nd);f=false;} cout<<"\n";
-        }
-    }
-
-    cout<<"\n== 3. GRAF (muchii: src --R--> dst, [C..]=concept tinta) ==\n";
-    for(auto& e:graph.edges)
-        cout<<"  "<<tok.name(e.src)<<" --R"<<e.relCluster<<"--> "<<tok.name(e.dst)
-            <<"  [C"<<nodeConcept[e.dst]<<"]  conf="<<e.confidence<<(e.derived?"  (derivat)":"")<<"\n";
-
-    // ============================================================
-    //  4. CONCEPT FORMATION — abstractizare: unim conceptele de baza ale caror
-    //  centroizi sunt apropiati vectorial intr-un SUPER-CONCEPT S (ierarhie).
-    // ============================================================
-    map<int,vector<float>> conCentroid; map<int,int> conCount;
-    for(auto& kv:nodeConcept){ auto v=enc.tokenVec(kv.first);
-        auto& c=conCentroid[kv.second]; if(c.empty())c.assign(v.size(),0);
-        for(size_t k=0;k<v.size();k++)c[k]+=v[k]; conCount[kv.second]++; }
-    for(auto& kv:conCentroid) for(float& x:kv.second) x/=conCount[kv.first];
-    map<int,int> parent; for(auto& kv:conCentroid) parent[kv.first]=kv.first;
-    function<int(int)> findp=[&](int x){ while(parent[x]!=x){parent[x]=parent[parent[x]];x=parent[x];} return x; };
-    {
-        float superThresh=0.33f;
-        vector<int> cids; for(auto& kv:conCentroid) cids.push_back(kv.first);
-        for(size_t i=0;i<cids.size();i++) for(size_t j=i+1;j<cids.size();j++)
-            if(cosSim(conCentroid[cids[i]],conCentroid[cids[j]])>=superThresh){
-                int a=findp(cids[i]),b=findp(cids[j]); if(a!=b)parent[a]=b; }
-    }
-    map<int,int> superId; int nextSuper=0; map<int,int> conSuper;
-    for(auto& kv:conCentroid){ int r=findp(kv.first);
-        if(!superId.count(r))superId[r]=nextSuper++; conSuper[kv.first]=superId[r]; }
-    cout<<"\n== 4. CONCEPT FORMATION (super-concepte S = uniune de clustere) ==\n";
-    {
-        map<int,vector<int>> bySuper; for(auto& kv:conSuper) bySuper[kv.second].push_back(kv.first);
-        map<int,vector<int>> conMembers; for(auto& kv:nodeConcept) conMembers[kv.second].push_back(kv.first);
-        for(auto& kv:bySuper){
-            cout<<"  S"<<kv.first<<"  <= { ";
-            bool f=true; for(int c:kv.second){cout<<(f?"":", ")<<"C"<<c;f=false;} cout<<" } : ";
-            f=true; for(int c:kv.second) for(int nd:conMembers[c]){cout<<(f?"":", ")<<tok.name(nd);f=false;}
-            cout<<"\n";
-        }
-    }
-
-    // ============================================================
-    //  5. CONCEPT COMPRESSION — daca multe muchii au aceeasi semnatura
-    //  (Csrc, R, Cdst), o comprimam intr-o abstractizare A (regularitate).
-    // ============================================================
-    cout<<"\n== 5. CONCEPT COMPRESSION (motive repetate -> abstractizari A) ==\n";
-    {
-        map<tuple<int,int,int>,vector<int>> motif;
-        for(size_t i=0;i<graph.edges.size();i++){ auto& e=graph.edges[i]; if(e.derived)continue;
-            motif[make_tuple(nodeConcept[e.src],e.relCluster,nodeConcept[e.dst])].push_back((int)i); }
-        int aid=0;
-        for(auto& kv:motif) if((int)kv.second.size()>=2){
-            int cs,r,cd; tie(cs,r,cd)=kv.first;
-            cout<<"  A"<<aid++<<"  (C"<<cs<<" --R"<<r<<"--> C"<<cd<<")  comprima "<<kv.second.size()<<" muchii:";
-            for(int ei:kv.second) cout<<"  "<<tok.name(graph.edges[ei].src)<<"->"<<tok.name(graph.edges[ei].dst);
-            cout<<"\n";
-        }
-        if(aid==0) cout<<"  (niciun motiv repetat de >=2 ori)\n";
-    }
-
-    // ============================================================
-    //  6. CAUSAL DISCOVERY — fara reguli: cat de tare PREZICE src tinta dst
-    //  (probabilitate next-token din encoder = semnal cauzal/predictiv).
-    // ============================================================
-    vector<float> causal(graph.edges.size(),0.f);
-    for(size_t i=0;i<graph.edges.size();i++) causal[i]=enc.predProb({graph.edges[i].src},graph.edges[i].dst);
-    { float mx=0; for(float c:causal)mx=max(mx,c); if(mx>0)for(float& c:causal)c/=mx; } // normalizare [0,1]
-    cout<<"\n== 6. CAUSAL DISCOVERY (predictie src->dst; top muchii) ==\n";
-    {
-        vector<int> ord(graph.edges.size()); for(size_t i=0;i<ord.size();i++)ord[i]=(int)i;
-        sort(ord.begin(),ord.end(),[&](int a,int b){return causal[a]>causal[b];});
-        int lim=min((int)ord.size(),8);
-        for(int t=0;t<lim;t++){ auto& e=graph.edges[ord[t]];
-            cout<<"  "<<tok.name(e.src)<<" --R"<<e.relCluster<<"--> "<<tok.name(e.dst)<<"   causal="<<causal[ord[t]]<<"\n"; }
-    }
-
-    // ============================================================
-    //  7. GOAL DISCOVERY — noduri spre care CONVERG multe lanturi (atractori).
-    //  reachCount[v] = cate noduri-sursa pot ajunge la v in graf.
-    // ============================================================
-    map<int,int> reachCount;
-    for(int s:graph.nodes){
-        set<int> seen; queue<int> q; q.push(s); seen.insert(s);
-        while(!q.empty()){ int u=q.front();q.pop();
-            for(int ei:graph.outIdx(u)){ int v=graph.edges[ei].dst; if(!seen.count(v)){seen.insert(v);q.push(v);} } }
-        for(int v:seen) if(v!=s) reachCount[v]++;
-    }
-    int maxReach=0; for(auto& kv:reachCount) maxReach=max(maxReach,kv.second);
-    set<int> goalSet;
-    cout<<"\n== 7. GOAL DISCOVERY (atractori = scop candidat) ==\n";
-    {
-        vector<pair<int,int>> v(reachCount.begin(),reachCount.end());
-        sort(v.begin(),v.end(),[](const pair<int,int>&a,const pair<int,int>&b){return a.second>b.second;});
-        float goalThresh=0.6f;
-        int lim=min((int)v.size(),8);
-        for(int t=0;t<lim;t++){ float gn=maxReach? (float)v[t].second/maxReach:0.f;
-            bool isGoal=gn>=goalThresh; if(isGoal) goalSet.insert(v[t].first);
-            cout<<"  "<<tok.name(v[t].first)<<"  convergenta="<<v[t].second<<" ("<<gn<<")"<<(isGoal?"  <= scop candidat":"")<<"\n"; }
-    }
-
-    // ============================================================
-    //  8. WORLD MODEL — simuleaza pasi urmarind predictia maxima si evalueaza
-    //  consecinta (coerenta = produsul predictiilor pe traiectorie).
-    // ============================================================
-    auto simulate=[&](int start,int steps){
-        vector<int> traj{start}; float coher=1.f; int cur=start; set<int> seen{start};
-        for(int s=0;s<steps;s++){
-            int bestE=-1; float bestP=-1;
-            for(int ei:graph.outIdx(cur)){ if(seen.count(graph.edges[ei].dst))continue;
-                if(causal[ei]>bestP){bestP=causal[ei];bestE=ei;} }
-            if(bestE<0)break;
-            cur=graph.edges[bestE].dst; traj.push_back(cur); seen.insert(cur); coher*=max(1e-3f,bestP);
-        }
-        return make_pair(traj,coher);
+        vector<float> eemb=meanVec(ids,0,ids.size());
+        graph.addEdge(s,d,rc,0.9f,eemb);
+        for(int n:{s,d}) nodeConcept[n]=conClust.assign(store.E[n]); // concept (online)
     };
-    cout<<"\n== 8. WORLD MODEL (simulare + consecinte) ==\n";
-    {
-        int shown=0;
-        for(int n:nodeList){ if(graph.outIdx(n).empty())continue;
-            auto pr=simulate(n,6); if(pr.first.size()<2)continue;
-            cout<<"  din '"<<tok.name(n)<<"':  ";
-            for(size_t i=0;i<pr.first.size();i++){if(i)cout<<" -> ";cout<<tok.name(pr.first[i]);}
-            cout<<"   coerenta="<<pr.second<<"\n";
-            if(++shown>=4)break;
-        }
+
+    // ---- A. INVATARE LENTA: pretrain corp + embeddings pe corpus romanesc ----
+    vector<string> ro = {
+        "om este fiinta", "om este viu", "pisica este animal", "caine este animal",
+        "pisica mananca hrana", "caine mananca hrana", "om mananca hrana",
+        "Ion este om", "Vasile este om", "Ion lucreaza sofer",
+        "sofer conduce camion", "munca produce bani", "motorul produce putere",
+        "focul produce caldura", "bani cumpara hrana", "hrana sustine om",
+        "om munceste pentru bani"
+    };
+    vector<vector<int>> roIds;
+    { vector<string> nw; for(auto& s:ro) roIds.push_back(tokenize(s,nw)); }
+
+    cout<<"== A. INVATARE LENTA (pretrain corp transformer + embeddings) ==\n";
+    cout<<"   vocabular initial: "<<store.size()<<" tokeni\n";
+    float step=0;
+    for(int ep=0;ep<400;ep++){ float tot=0;int c=0;
+        vector<int> ord(roIds.size()); for(int i=0;i<(int)ord.size();i++)ord[i]=i;
+        shuffle(ord.begin(),ord.end(),rng);
+        for(int i:ord){ tot+=T.trainSeq(roIds[i], true, 0.01f, 1e-3f, step); c++; }
+        if(ep%100==0) cout<<"   epoch "<<ep<<"  loss "<<tot/max(1,c)<<"\n";
     }
+    // construieste graful din corpus
+    for(auto& ids:roIds) absorbSentence(ids);
+    cout<<"   graf: "<<graph.nodes.size()<<" noduri, "<<graph.edges.size()<<" muchii\n\n";
+
+    auto showConcepts=[&](){
+        map<int,vector<int>> byc; for(auto&kv:nodeConcept)byc[kv.second].push_back(kv.first);
+        for(auto&kv:byc){ cout<<"     C"<<kv.first<<": "; bool f=true;
+            for(int n:kv.second){cout<<(f?"":", ")<<tok.name(n);f=false;} cout<<"\n"; } };
+    cout<<"== Concepte emergente dupa corpusul romanesc ==\n"; showConcepts(); cout<<"\n";
+
+    auto neighbors=[&](const string& w,int k){
+        int id=tok.get(w); if(id<0){cout<<"     (necunoscut)\n";return;}
+        vector<pair<float,int>> v;
+        for(int n:graph.nodes){ if(n==id)continue; v.push_back({cosv(store.E[id],store.E[n]),n}); }
+        sort(v.begin(),v.end(),[](auto&a,auto&b){return a.first>b.first;});
+        cout<<"     "<<w<<" ~ "; for(int i=0;i<k&&i<(int)v.size();i++)cout<<tok.name(v[i].second)<<"("<<v[i].first<<") ";
+        cout<<"\n"; };
+
+    // ---- B+C. ONLINE: cuvinte noi inventate (corp INGHETAT) ----
+    cout<<"== B. ONLINE: cuvinte noi inventate (fara retraining al corpului) ==\n";
+    vector<string> invent = { "blorf este animal", "blorf mananca hrana", "blorf este viu" };
+    for(auto& s:invent){
+        vector<string> nw; auto ids=tokenize(s,nw);
+        for(auto& w:nw) cout<<"   [TOKEN NOU] \""<<w<<"\" -> id "<<tok.get(w)<<", embedding init din caractere\n";
+        // invatare adaptiva: doar embeddingurile se misca (corp inghetat).
+        // wd mai mare tine norma marginita => tokenii noi nu domina logitii.
+        for(int it=0;it<25;it++) T.trainSeq(ids, false, 0.012f, 6e-3f, step);
+        absorbSentence(ids);
+        cout<<"   [ABSORBIT] \""<<s<<"\"  -> noduri/muchii/concepte actualizate\n";
+    }
+    cout<<"   vecini invatati pentru cuvant nou:\n"; neighbors("blorf",4);
+    cout<<"   concepte dupa cuvinte noi:\n"; showConcepts(); cout<<"\n";
+
+    // ---- D. ONLINE: limba noua (engleza), fara dictionar ----
+    cout<<"== C. ONLINE: limba noua (engleza) conectata prin context ==\n";
+    vector<string> en = { "man is human", "man is living", "cat is animal",
+                          "cat eats food", "driver drives truck", "work produces money" };
+    for(auto& s:en){ vector<string> nw; auto ids=tokenize(s,nw);
+        for(auto& w:nw) cout<<"   [TOKEN NOU en] \""<<w<<"\" id "<<tok.get(w)<<"\n";
+        for(int it=0;it<25;it++) T.trainSeq(ids, false, 0.012f, 6e-3f, step);
+        absorbSentence(ids);
+    }
+    cout<<"   aliniere cross-lingva emergenta (cosine, fara dictionar):\n";
+    for(string w:{string("man"),string("cat"),string("driver"),string("work"),string("food")}) neighbors(w,3);
+    cout<<"\n";
 
     // ============================================================
-    //  9. CONTINUOUS LEARNING — conceptele se re-formeaza cand apar date noi:
-    //  clusterizam nodurile dupa prima jumatate de corpus vs dupa tot.
+    //  GRAPH-AUGMENTED NEXT TOKEN
+    //  hidden -> GraphAttention(top-k noduri) -> ConceptContext ->
+    //  FusionGate (scalar numeric) -> fused -> logits TIED -> LogitBias ->
+    //  argmax -> update ActiveGraphState
     // ============================================================
-    cout<<"\n== 9. CONTINUOUS LEARNING (conceptele se schimba cu date noi) ==\n";
-    {
-        auto clusterNodes=[&](const set<int>& ns){
-            Clusterer cc(0.38f); map<int,int> m;
-            vector<int> v(ns.begin(),ns.end()); sort(v.begin(),v.end());
-            for(int nd:v) m[nd]=cc.assign(enc.tokenVec(nd));
-            return make_pair(m,(int)cc.centroid.size());
-        };
-        int half=max(1,(int)factIds.size()/2);
-        set<int> nodesHalf;
-        for(int i=0;i<half;i++) if(factIds[i].size()>=2){ nodesHalf.insert(factIds[i].front()); nodesHalf.insert(factIds[i].back()); }
-        auto a=clusterNodes(nodesHalf); auto b=clusterNodes(graph.nodes);
-        cout<<"  dupa "<<half<<" documente: "<<nodesHalf.size()<<" noduri / "<<a.second<<" concepte\n";
-        cout<<"  dupa tot corpusul: "<<graph.nodes.size()<<" noduri / "<<b.second<<" concepte\n";
-        int merged=0;
-        for(auto& kv:a.first){ // noduri prezente in ambele care si-au schimbat gruparea
-            int nd=kv.first; if(!b.first.count(nd))continue;
-        }
-        (void)merged;
-        cout<<"  => pe masura ce intra documente noi, nodurile se re-grupeaza (clustere noi / fuziuni).\n";
-    }
+    auto graphAttention=[&](const vector<float>& h, const ActiveGraphState& A, int K,
+                            vector<int>& topNodes, vector<float>& topW)->vector<float>{
+        vector<pair<float,int>> sc;
+        for(int n:graph.nodes){ float a=0; auto it=A.act.find(n); if(it!=A.act.end())a=it->second;
+            float s=cosv(h,store.E[n])*(0.5f+a);   // similaritate modulata de activare
+            sc.push_back({s,n}); }
+        sort(sc.begin(),sc.end(),[](auto&a,auto&b){return a.first>b.first;});
+        vector<float> g(D,0); float Z=0; topNodes.clear(); topW.clear();
+        for(int i=0;i<K&&i<(int)sc.size();i++){ float w=max(0.f,sc[i].first); topNodes.push_back(sc[i].second);
+            topW.push_back(w); for(int k=0;k<D;k++)g[k]+=w*store.E[sc[i].second][k]; Z+=w; }
+        if(Z>0)for(float&x:g)x/=Z; return g;
+    };
 
-    // ============================================================
-    //  10. HYPOTHESIS GENERATION + MULTI-PATH REASONING
-    //  Nu mai exista regula "gaseste nodurile din intrebare si porneste de
-    //  acolo". Generam un SPATIU de ipoteze = multe drumuri din tot graful.
-    //  Pentru o intrebare scoram FIECARE ipoteza cu un scor numeric compus:
-    //     query_sim + path_confidence + causal + goal + concept_match
-    //  Alegem ipoteza maxima; daca scorul/relevanta < prag => "Nu stiu".
-    // ============================================================
-    struct Hyp{ vector<int> nodes,rels,eidx; };
-    vector<Hyp> hyps;
-    {
-        const int HMAX=1500, LMAX=6;
-        function<void(int,set<int>&,vector<int>&,vector<int>&,vector<int>&)> gen;
-        gen=[&](int cur,set<int>& vis,vector<int>& n,vector<int>& r,vector<int>& ei){
-            if((int)hyps.size()>=HMAX) return;
-            if(n.size()>=2){ Hyp h; h.nodes=n; h.rels=r; h.eidx=ei; hyps.push_back(h); }
-            if((int)n.size()>=LMAX) return;
-            for(int e:graph.outIdx(cur)){ int d=graph.edges[e].dst; if(vis.count(d))continue;
-                vis.insert(d);n.push_back(d);r.push_back(graph.edges[e].relCluster);ei.push_back(e);
-                gen(d,vis,n,r,ei);
-                vis.erase(d);n.pop_back();r.pop_back();ei.pop_back();
+    // genereaza ghidat de graf; tipareste detaliile primului pas
+    auto generate=[&](const string& prompt,int steps,bool verbose){
+        vector<string> nw; auto ctx=tokenize(prompt,nw);
+        // seed active state cu nodurile din prompt care exista in graf
+        ActiveGraphState A; { vector<int> seed; for(int t:ctx) if(graph.isNode(t))seed.push_back(t); A.seed(seed,1.f); }
+        // query embedding (pentru bias bazat pe relevanta)
+        vector<float> qv=meanVec(ctx,0,ctx.size());
+        string outText; vector<int> gen=ctx; float supportTotal=0; int supportSteps=0;
+        map<int,int> usedCount; for(int t:ctx) usedCount[t]++;
+        for(int s=0;s<steps;s++){
+            A.spread(graph);
+            vector<float> h=T.hiddenLast(gen);
+            vector<int> topNodes; vector<float> topW;
+            vector<float> g=graphAttention(h,A,5,topNodes,topW);
+            // FusionGate: cat de mult contează graful (numeric, din alinierea h-g si masa activarii)
+            float align=cosv(h,g); float mass=0; for(float w:topW)mass+=w;
+            float gate=sigm(2.0f*align + 0.3f*mass - 0.5f);
+            vector<float> fused(D); for(int k=0;k<D;k++)fused[k]=(1-gate)*h[k]+gate*g[k];
+            // logits pe baza de DIRECTIE (cosine), ca un token sa nu domine prin
+            // norma (decuplare de inflatia embeddingurilor invatate online).
+            auto cosLogits=[&](const vector<float>& x){ int V=store.size(); vector<float> z(V);
+                float xn=nrm(x); for(int v=0;v<V;v++) z[v]=8.0f*dotv(x,store.E[v])/(xn*nrm(store.E[v])+1e-9f); return z; };
+            vector<float> base=cosLogits(h);          // logits din transformer pur
+            vector<float> z=cosLogits(fused);         // logits dupa fuziune cu graful
+            // LogitBias memory-aware: tokenii-noduri ACTIVE primesc bias pozitiv
+            // (activare * relevanta query); ceilalti primesc o usoara suprimare,
+            // ca generarea factuala sa stea in vecinatatea sustinuta de graf.
+            float beta=4.0f, gamma=9.0f, bestSupport=0;
+            for(float& zv:z) zv-=gamma;
+            for(auto& kv:A.act){ int node=kv.first; if(node<0||node>=(int)z.size())continue;
+                float rel=max(0.f,cosv(qv,store.E[node]));
+                float sup=kv.second*rel;
+                z[node]+=gamma+beta*sup; bestSupport=max(bestSupport,sup); }
+            supportTotal+=bestSupport; supportSteps++;
+            // penalizare de repetitie (numeric): tokenii deja folositi scad
+            for(auto& kv:usedCount) if(kv.first<(int)z.size()) z[kv.first]-=1.5f*kv.second;
+            int tok_best=-1; float bz=-1e9; for(int v=0;v<(int)z.size();v++){ if(v==gen.back())continue;
+                if(z[v]>bz){bz=z[v];tok_best=v;} }
+            if(verbose && s==0){
+                cout<<"   [pas 0] gate(graf vs transformer)="<<gate<<"  align="<<align<<"\n";
+                cout<<"   active top: "; for(auto&p:A.topk(5))cout<<tok.name(p.first)<<"("<<p.second<<") "; cout<<"\n";
+                auto top5=[&](vector<float> zz){ vector<pair<float,int>> v; for(int i=0;i<(int)zz.size();i++)v.push_back({zz[i],i});
+                    sort(v.begin(),v.end(),[](auto&a,auto&b){return a.first>b.first;});
+                    for(int i=0;i<5&&i<(int)v.size();i++)cout<<tok.name(v[i].second)<<"("<<v[i].first<<") "; cout<<"\n"; };
+                cout<<"   logits TRANSFORMER pur : "; top5(base);
+                cout<<"   logits + GRAPH BIAS    : "; top5(z);
             }
-        };
-        for(int s:nodeList){ if((int)hyps.size()>=HMAX)break; set<int> vis{s}; vector<int> n{s},r,ei; gen(s,vis,n,r,ei); }
-    }
-    cout<<"\n== 10. HYPOTHESIS GENERATION ("<<hyps.size()<<" ipoteze) + MULTI-PATH SCORING ==\n";
-
-    // Relevanta fata de intrebare (sQ) e semnalul PRIMAR; confidence/causal/goal
-    // sunt modelatori SECUNDARI, activi doar cand drumul e relevant (inmultiti
-    // cu sQ). Asa, o muchie cu causal mare dar irelevanta nu poate castiga.
-    const float W_Q=1.0f,W_CON=0.25f,W_CONF=0.2f,W_CAUS=0.3f,W_GOAL=0.45f,W_OVL=0.5f;
-    const float TAU=0.30f;     // prag scor minim (anti-halucinatie)
-    const float QMIN=0.20f;    // prag relevanta query minima (gateaza raspunsul)
-    auto pathEdgeMean=[&](const Hyp& h){ vector<float> v(enc.D,0);
-        for(int e:h.eidx){auto& em=graph.edges[e].emb; for(int k=0;k<enc.D;k++)v[k]+=em[k];}
-        if(!h.eidx.empty())for(float& x:v)x/=h.eidx.size(); return v; };
-    auto pathNodeMean=[&](const Hyp& h){ vector<float> v(enc.D,0);
-        for(int nd:h.nodes){auto t=enc.tokenVec(nd); for(int k=0;k<enc.D;k++)v[k]+=t[k];}
-        if(!h.nodes.empty())for(float& x:v)x/=h.nodes.size(); return v; };
-
-    for(size_t qi=0;qi<qIds.size();qi++){
-        const auto& ids=qIds[qi];
-        cout<<"\n  Q: \""<<qLines[qi]<<"\"\n";
-        vector<float> q=enc.meanVec(ids,0,ids.size());
-        set<int> qset(ids.begin(),ids.end());          // identitate de token (semnal soft de potrivire)
-        int best=-1; float bestScore=-1e9f, bestQ=0;
-        vector<pair<float,int>> ranked; ranked.reserve(hyps.size());
-        for(size_t i=0;i<hyps.size();i++){
-            const Hyp& h=hyps[i];
-            float sQ=max(0.f,cosSim(q,pathEdgeMean(h)));
-            float sCon=max(0.f,cosSim(q,pathNodeMean(h)));
-            float sConf=0,sCaus=0; for(int e:h.eidx){sConf+=graph.edges[e].confidence;sCaus+=causal[e];}
-            if(!h.eidx.empty()){sConf/=h.eidx.size();sCaus/=h.eidx.size();}
-            float sGoal=0; for(int nd:h.nodes) if(goalSet.count(nd)){sGoal=1;break;}
-            // potrivire de identitate (soft): fractia de noduri din drum prezente
-            // in intrebare. NU e un start fix, doar inca un semnal numeric care
-            // departajeaza noduri cu embedding aproape identic (Ion vs Vasile).
-            float sOvl=0; for(int nd:h.nodes) if(qset.count(nd))sOvl+=1; if(!h.nodes.empty())sOvl/=h.nodes.size();
-            // a ajunge la un SCOP descoperit e valoros in sine (termen aditiv);
-            // confidence/causal raman modelatori legati de relevanta (×sQ).
-            float score=W_Q*sQ + W_CON*sCon + W_GOAL*sGoal + W_OVL*sOvl + sQ*(W_CONF*sConf+W_CAUS*sCaus);
-            ranked.push_back({score,(int)i});
-            if(score>bestScore){bestScore=score;best=(int)i;bestQ=sQ;}
+            if(tok_best<0)break;
+            gen.push_back(tok_best); usedCount[tok_best]++;
+            outText+=(outText.empty()?"":" ")+tok.name(tok_best);
+            A.decay(); A.reinforce(tok_best,0.6f);   // reinforcement: tokenul confirma path-ul
         }
-        sort(ranked.begin(),ranked.end(),[](const pair<float,int>&a,const pair<float,int>&b){return a.first>b.first;});
-        int show=min((int)ranked.size(),3);
-        for(int t=0;t<show;t++){ const Hyp& h=hyps[ranked[t].second];
-            cout<<"     ipoteza#"<<t<<" scor="<<ranked[t].first<<" : ";
-            for(size_t k=0;k<h.nodes.size();k++){if(k)cout<<" -> ";cout<<tok.name(h.nodes[k]);} cout<<"\n"; }
-        if(best<0 || bestScore<TAU || bestQ<QMIN){
-            cout<<"     A: Nu stiu. (scor="<<bestScore<<", query_sim="<<bestQ<<")\n"; continue;
-        }
-        const Hyp& h=hyps[best];
-        cout<<"     A: ";
-        for(size_t k=0;k<h.nodes.size();k++){if(k)cout<<" -> ";cout<<tok.name(h.nodes[k]);}
-        cout<<"\n        path: ";
-        for(size_t k=0;k+1<h.nodes.size();k++) cout<<tok.name(h.nodes[k])<<" --R"<<h.rels[k]<<"--> ";
-        cout<<tok.name(h.nodes.back())<<"\n        scor="<<bestScore<<"  query_sim="<<bestQ<<"\n";
-    }
+        float support = supportSteps? supportTotal/supportSteps : 0;
+        return make_pair(outText,support);
+    };
+
+    cout<<"== GRAPH-AUGMENTED GENERATION ==\n";
+    cout<<"  prompt: \"Ion\"\n";
+    { auto r=generate("Ion",6,true); cout<<"  => raspuns: \""<<r.first<<"\"   support="<<r.second<<"\n\n"; }
+    cout<<"  prompt: \"om munceste\"\n";
+    { auto r=generate("om munceste",6,false); cout<<"  => raspuns: \""<<r.first<<"\"   support="<<r.second<<"\n\n"; }
+
+    // ============================================================
+    //  ANTI-HALUCINATIE: verdict numeric, nu hardcodat semantic.
+    //  Daca suportul din graf < prag => raspunsul devine "Nu stiu".
+    // ============================================================
+    cout<<"== ANTI-HALUCINATIE (verdict pe scor de suport) ==\n";
+    const float SUPPORT_MIN=0.12f;
+    auto answer=[&](const string& prompt){
+        auto r=generate(prompt,6,false);
+        cout<<"  Q: \""<<prompt<<"\"  support="<<r.second;
+        if(r.second<SUPPORT_MIN) cout<<"  =>  Nu stiu.\n";
+        else cout<<"  =>  \""<<r.first<<"\"\n";
+    };
+    answer("Ion");                 // sustinut de graf
+    answer("blorf");               // sustinut (invatat online)
+    answer("xyzzy zextro");        // necunoscut total => Nu stiu
+
     return 0;
 }
