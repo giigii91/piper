@@ -971,147 +971,68 @@ static float signContradiction(const vector<int>& path,const SignedWorldModel& s
     return 0.f;
 }
 
-// ====== (2) LIMBAJ REAL — Lexer + Parser recursiv-descendent + Interpreter cu
-//  control-flow/functii/recursie + Type unification + Scope lexical + Call graph.
-//  Acesta inlocuieste "programming graph" jucarie cu un limbaj mic dar REAL.
-namespace Lang {
-enum Tk{ T_EOF,T_NUM,T_ID,T_LET,T_IF,T_ELSE,T_WHILE,T_FN,T_RET,T_PRINT,T_TRUE,T_FALSE,
-         T_LP,T_RP,T_LB,T_RB,T_COMMA,T_SEMI,T_ASSIGN,T_PLUS,T_MINUS,T_STAR,T_SLASH,
-         T_EQ,T_NE,T_LT,T_GT,T_LE,T_GE,T_NOT };
-struct Token{ Tk t; double num=0; string id; };
-struct Lexer{
-    string s; size_t i=0; vector<Token> out;
-    Lexer(const string& src):s(src){}
-    void lex(){ while(i<s.size()){ char c=s[i];
-        if(isspace((unsigned char)c)){i++;continue;}
-        if(isdigit((unsigned char)c)){ double n=0; while(i<s.size()&&isdigit((unsigned char)s[i])){n=n*10+(s[i]-'0');i++;} out.push_back({T_NUM,n,""}); continue; }
-        if(isalpha((unsigned char)c)||c=='_'){ string id; while(i<s.size()&&(isalnum((unsigned char)s[i])||s[i]=='_')){id+=s[i];i++;}
-            Tk t=T_ID; if(id=="let")t=T_LET; else if(id=="if")t=T_IF; else if(id=="else")t=T_ELSE;
-            else if(id=="while")t=T_WHILE; else if(id=="fn")t=T_FN; else if(id=="return")t=T_RET;
-            else if(id=="print")t=T_PRINT; else if(id=="true")t=T_TRUE; else if(id=="false")t=T_FALSE;
-            out.push_back({t,0,id}); continue; }
-        auto two=[&](char a,char b,Tk tk)->bool{ if(c==a&&i+1<s.size()&&s[i+1]==b){out.push_back({tk,0,""});i+=2;return true;} return false; };
-        if(two('=','=',T_EQ)||two('!','=',T_NE)||two('<','=',T_LE)||two('>','=',T_GE))continue;
-        Tk t=T_EOF; switch(c){ case '(':t=T_LP;break;case ')':t=T_RP;break;case '{':t=T_LB;break;case '}':t=T_RB;break;
-            case ',':t=T_COMMA;break;case ';':t=T_SEMI;break;case '=':t=T_ASSIGN;break;case '+':t=T_PLUS;break;
-            case '-':t=T_MINUS;break;case '*':t=T_STAR;break;case '/':t=T_SLASH;break;case '<':t=T_LT;break;
-            case '>':t=T_GT;break;case '!':t=T_NOT;break; default: i++; continue; }
-        out.push_back({t,0,""}); i++; }
-        out.push_back({T_EOF,0,""}); }
-};
-enum NK{ N_NUM,N_BOOL,N_VAR,N_ASSIGN,N_LET,N_BIN,N_UNARY,N_IF,N_WHILE,N_BLOCK,N_FN,N_CALL,N_RET,N_PRINT };
-struct Node{ NK k; double num=0; bool b=false; string name; int op=0; vector<int> ch; };
-struct Parser{
-    vector<Token>& t; size_t p=0; vector<Node>& A; vector<int>& top;
-    map<string,pair<vector<string>,int>>& funcs;  // name -> (params, bodyBlock)
-    Parser(vector<Token>& toks,vector<Node>& arena,vector<int>& topLevel,map<string,pair<vector<string>,int>>& fn)
-        :t(toks),A(arena),top(topLevel),funcs(fn){}
-    Token& cur(){ return t[p]; } bool is(Tk k){ return t[p].t==k; }
-    bool eat(Tk k){ if(is(k)){p++;return true;} return false; }
-    int mk(Node n){ A.push_back(n); return (int)A.size()-1; }
-    void parse(){ while(!is(T_EOF)){ int s=stmt(); if(s>=0) top.push_back(s); } }
-    int block(){ Node bl; bl.k=N_BLOCK; eat(T_LB); while(!is(T_RB)&&!is(T_EOF)){ int s=stmt(); if(s>=0)bl.ch.push_back(s);} eat(T_RB); return mk(bl); }
-    int stmt(){
-        if(eat(T_FN)){ string name=cur().id; eat(T_ID); eat(T_LP); vector<string> ps;
-            while(!is(T_RP)&&!is(T_EOF)){ ps.push_back(cur().id); eat(T_ID); if(!eat(T_COMMA))break; } eat(T_RP);
-            int body=block(); funcs[name]={ps,body}; Node f; f.k=N_FN; f.name=name; f.ch={body}; return mk(f); }
-        if(eat(T_LET)){ string name=cur().id; eat(T_ID); eat(T_ASSIGN); int e=expr(); eat(T_SEMI);
-            Node n; n.k=N_LET; n.name=name; n.ch={e}; return mk(n); }
-        if(eat(T_IF)){ eat(T_LP); int c=expr(); eat(T_RP); int th=block(); int el=-1; if(eat(T_ELSE)) el=block();
-            Node n; n.k=N_IF; n.ch={c,th}; if(el>=0)n.ch.push_back(el); return mk(n); }
-        if(eat(T_WHILE)){ eat(T_LP); int c=expr(); eat(T_RP); int bd=block(); Node n; n.k=N_WHILE; n.ch={c,bd}; return mk(n); }
-        if(eat(T_RET)){ int e=expr(); eat(T_SEMI); Node n; n.k=N_RET; n.ch={e}; return mk(n); }
-        if(eat(T_PRINT)){ int e=expr(); eat(T_SEMI); Node n; n.k=N_PRINT; n.ch={e}; return mk(n); }
-        if(is(T_ID)&&t[p+1].t==T_ASSIGN){ string name=cur().id; eat(T_ID); eat(T_ASSIGN); int e=expr(); eat(T_SEMI);
-            Node n; n.k=N_ASSIGN; n.name=name; n.ch={e}; return mk(n); }
-        int e=expr(); eat(T_SEMI); return e;
+// ====== PROGRAM LEARNING ENGINE — invata structura DOAR din TRACES de
+//  executie (valori observate), NU din keyword-uri. "Sensorul" ofera simboluri
+//  OPACE + valorile lor; semnificatia (variabile, dependente, functii de
+//  tranzitie) e DESCOPERITA din dinamica. Niciun if(token=="for"/"while"/...).
+struct TraceLearner {
+    int nSym=0; map<pair<int,int>,float> coef; vector<int> varying;
+    void learn(int symbols,const vector<vector<map<int,double>>>& traces,int iters,float lr){
+        nSym=symbols; coef.clear();
+        for(int b=0;b<nSym;b++) for(int a=0;a<nSym;a++) coef[{a,b}]=0.f;
+        for(int it=0;it<iters;it++){ map<pair<int,int>,double> grad; map<pair<int,int>,int> cnt;
+            for(auto& tr:traces) for(size_t t=1;t<tr.size();t++) for(int b=0;b<nSym;b++){
+                auto pb=tr[t].find(b); if(pb==tr[t].end())continue; double pred=0;
+                for(int a=0;a<nSym;a++){ auto pa=tr[t-1].find(a); if(pa!=tr[t-1].end())pred+=coef[{a,b}]*pa->second; }
+                double err=pred-pb->second;
+                for(int a=0;a<nSym;a++){ auto pa=tr[t-1].find(a); if(pa==tr[t-1].end())continue; grad[{a,b}]+=err*pa->second; cnt[{a,b}]++; } }
+            for(auto& kv:grad){ int c=cnt[kv.first]; if(c) coef[kv.first]-=lr*kv.second/c; } }
+        varying.clear(); for(int s=0;s<nSym;s++){ double mn=1e18,mx=-1e18;
+            for(auto& tr:traces) for(auto& f:tr){ auto it=f.find(s); if(it!=f.end()){mn=min(mn,it->second);mx=max(mx,it->second);} }
+            if(mx-mn>1e-6) varying.push_back(s); }
     }
-    int expr(){ return equality(); }
-    int equality(){ int a=comp(); while(is(T_EQ)||is(T_NE)){ int op=cur().t;p++; int b=comp(); Node n;n.k=N_BIN;n.op=op;n.ch={a,b};a=mk(n);} return a; }
-    int comp(){ int a=term(); while(is(T_LT)||is(T_GT)||is(T_LE)||is(T_GE)){ int op=cur().t;p++; int b=term(); Node n;n.k=N_BIN;n.op=op;n.ch={a,b};a=mk(n);} return a; }
-    int term(){ int a=factor(); while(is(T_PLUS)||is(T_MINUS)){ int op=cur().t;p++; int b=factor(); Node n;n.k=N_BIN;n.op=op;n.ch={a,b};a=mk(n);} return a; }
-    int factor(){ int a=unary(); while(is(T_STAR)||is(T_SLASH)){ int op=cur().t;p++; int b=unary(); Node n;n.k=N_BIN;n.op=op;n.ch={a,b};a=mk(n);} return a; }
-    int unary(){ if(is(T_MINUS)||is(T_NOT)){ int op=cur().t;p++; int a=unary(); Node n;n.k=N_UNARY;n.op=op;n.ch={a}; return mk(n);} return callExpr(); }
-    int callExpr(){ int a=primary(); if(is(T_LP)&&a>=0&&A[a].k==N_VAR){ eat(T_LP); Node c;c.k=N_CALL;c.name=A[a].name;
-            while(!is(T_RP)&&!is(T_EOF)){ c.ch.push_back(expr()); if(!eat(T_COMMA))break; } eat(T_RP); return mk(c);} return a; }
-    int primary(){ if(is(T_NUM)){ Node n;n.k=N_NUM;n.num=cur().num;p++;return mk(n);}
-        if(is(T_TRUE)){p++;Node n;n.k=N_BOOL;n.b=true;return mk(n);} if(is(T_FALSE)){p++;Node n;n.k=N_BOOL;n.b=false;return mk(n);}
-        if(is(T_ID)){ Node n;n.k=N_VAR;n.name=cur().id;p++;return mk(n);}
-        if(eat(T_LP)){ int e=expr(); eat(T_RP); return e; } p++; return -1; }
 };
-// Interpreter cu environments (recursie, if/while). Value = INT sau BOOL.
-struct Value{ enum T{INT,BOOL} ty=INT; long i=0; };
-struct Interp{
-    vector<Node>& A; map<string,pair<vector<string>,int>>& funcs; vector<map<string,Value>> env;
-    bool returning=false; Value retval; vector<string> output;
-    Interp(vector<Node>& a,map<string,pair<vector<string>,int>>& f):A(a),funcs(f){ env.push_back({}); }
-    Value* find(const string& n){ for(int i=(int)env.size()-1;i>=0;i--){ auto it=env[i].find(n); if(it!=env[i].end())return &it->second; } return nullptr; }
-    Value eval(int id){ Node& n=A[id]; Value v;
-        switch(n.k){
-            case N_NUM: v.ty=Value::INT; v.i=(long)n.num; return v;
-            case N_BOOL: v.ty=Value::BOOL; v.i=n.b?1:0; return v;
-            case N_VAR:{ Value* p=find(n.name); if(p)return *p; v.i=0; return v; }
-            case N_UNARY:{ Value a=eval(n.ch[0]); if(n.op==T_MINUS)v.i=-a.i; else {v.ty=Value::BOOL;v.i=a.i?0:1;} return v; }
-            case N_BIN:{ Value a=eval(n.ch[0]),b=eval(n.ch[1]);
-                switch(n.op){ case T_PLUS:v.i=a.i+b.i;break;case T_MINUS:v.i=a.i-b.i;break;case T_STAR:v.i=a.i*b.i;break;
-                    case T_SLASH:v.i=b.i?a.i/b.i:0;break;
-                    case T_LT:v.ty=Value::BOOL;v.i=a.i<b.i;break;case T_GT:v.ty=Value::BOOL;v.i=a.i>b.i;break;
-                    case T_LE:v.ty=Value::BOOL;v.i=a.i<=b.i;break;case T_GE:v.ty=Value::BOOL;v.i=a.i>=b.i;break;
-                    case T_EQ:v.ty=Value::BOOL;v.i=a.i==b.i;break;case T_NE:v.ty=Value::BOOL;v.i=a.i!=b.i;break; } return v; }
-            case N_CALL:{ auto it=funcs.find(n.name); if(it==funcs.end()){v.i=0;return v;}
-                vector<Value> args; for(int c:n.ch)args.push_back(eval(c));
-                env.push_back({}); auto& ps=it->second.first; for(size_t k=0;k<ps.size()&&k<args.size();k++)env.back()[ps[k]]=args[k];
-                bool sr=returning; returning=false; exec(it->second.second); Value r=retval; returning=sr; retval=Value{};
-                env.pop_back(); return r; }
-            default: v.i=0; return v;
-        }
+
+// ====== EFFECT MODES — tipuri de efect EMERGENTE (clustere de polaritate),
+//  nu etichete "increase/decrease/block". Feature = [coef, |coef|] -> cluster.
+struct EffectModes {
+    map<int,int> edgeMode; int nModes=0;
+    void discover(const GraphMemory& g,const SignedWorldModel& sw){
+        Clusterer c(0.9f);
+        for(int ei=0;ei<(int)g.edges.size();ei++){ float w=sw.polarity(g.edges[ei].src,g.edges[ei].dst);
+            float m=fabs(w)<0.05f?1e-3f:fabs(w); vector<float> feat={w/m, 1.0f};   // directie de semn normalizata
+            edgeMode[ei]=c.assign(feat); }
+        nModes=(int)c.centroid.size();
     }
-    void exec(int id){ if(returning)return; Node& n=A[id];
-        switch(n.k){
-            case N_BLOCK:{ env.push_back({}); for(int c:n.ch){ exec(c); if(returning)break; } env.pop_back(); break; }
-            case N_LET: case N_ASSIGN:{ Value v=eval(n.ch[0]); Value* p=find(n.name);
-                if(n.k==N_ASSIGN && p) *p=v; else env.back()[n.name]=v; break; }
-            case N_IF:{ Value c=eval(n.ch[0]); if(c.i)exec(n.ch[1]); else if(n.ch.size()>2)exec(n.ch[2]); break; }
-            case N_WHILE:{ while(true){ Value c=eval(n.ch[0]); if(!c.i)break; exec(n.ch[1]); if(returning)break; } break; }
-            case N_RET:{ retval=eval(n.ch[0]); returning=true; break; }
-            case N_PRINT:{ Value v=eval(n.ch[0]); output.push_back(to_string(v.i)); break; }
-            case N_FN: break;  // declaratie
-            default: eval(id); break;
-        }
+};
+
+// ====== TEMPORAL MODEL — ordine / durata(lag) / frecventa dintr-un proces.
+struct TemporalModel {
+    map<pair<int,int>,int> freq; map<pair<int,int>,float> lag; map<pair<int,int>,int> lagN;
+    void learn(const vector<vector<int>>& seqs){
+        for(auto& s:seqs) for(size_t i=0;i<s.size();i++) for(size_t j=i+1;j<s.size();j++){
+            freq[{s[i],s[j]}]++; lag[{s[i],s[j]}]+=(float)(j-i); lagN[{s[i],s[j]}]++; }
+        for(auto& kv:lag) kv.second/=max(1,lagN[kv.first]);
     }
-    void runTop(const vector<int>& top){ for(int s:top) exec(s); }
+    vector<int> process(int start,int steps){ vector<int> p{start}; int cur=start; set<int> seen{start};
+        for(int s=0;s<steps;s++){ int best=-1,bf=0;
+            for(auto& kv:freq) if(kv.first.first==cur && !seen.count(kv.first.second) && lag[kv.first]<1.5f && kv.second>bf){bf=kv.second;best=kv.first.second;}
+            if(best<0)break; p.push_back(best); seen.insert(best); cur=best; } return p; }
 };
-// Type unification (lite): INT/BOOL; raporteaza tipuri + erori.
-enum Ty{ TY_UNK,TY_INT,TY_BOOL };
-struct Typer{
-    vector<Node>& A; map<string,Ty> varTy; int errors=0;
-    Typer(vector<Node>& a):A(a){}
-    Ty unify(Ty a,Ty b){ if(a==TY_UNK)return b; if(b==TY_UNK)return a; if(a!=b){errors++; } return a; }
-    Ty infer(int id){ Node& n=A[id]; switch(n.k){
-        case N_NUM: return TY_INT; case N_BOOL: return TY_BOOL;
-        case N_VAR:{ auto it=varTy.find(n.name); return it==varTy.end()?TY_UNK:it->second; }
-        case N_UNARY: return n.op==T_NOT?TY_BOOL:TY_INT;
-        case N_BIN:{ Ty a=infer(n.ch[0]),b=infer(n.ch[1]);
-            if(n.op==T_PLUS||n.op==T_MINUS||n.op==T_STAR||n.op==T_SLASH){ unify(a,TY_INT);unify(b,TY_INT); return TY_INT; }
-            unify(a,b); return TY_BOOL; }
-        case N_CALL: return TY_INT;   // demo: functii intorc INT
-        case N_LET: case N_ASSIGN:{ Ty e=infer(n.ch[0]); varTy[n.name]=unify(varTy.count(n.name)?varTy[n.name]:TY_UNK,e); return e; }
-        case N_IF:{ Ty c=infer(n.ch[0]); unify(c,TY_BOOL); for(size_t i=1;i<n.ch.size();i++)walk(n.ch[i]); return TY_UNK; }
-        case N_WHILE:{ Ty c=infer(n.ch[0]); unify(c,TY_BOOL); walk(n.ch[1]); return TY_UNK; }
-        case N_BLOCK: walk(id); return TY_UNK;
-        case N_RET: return infer(n.ch[0]);
-        case N_PRINT: infer(n.ch[0]); return TY_UNK;
-        case N_FN: walk(n.ch[0]); return TY_UNK;
-        default: return TY_UNK; } }
-    void walk(int id){ Node& n=A[id]; if(n.k==N_BLOCK){ for(int c:n.ch)walk(c); } else infer(id); }
+
+// ====== CREATIVE ENGINE — "metafora" = leaga noduri DEPARTATE in graf dar
+//  APROPIATE in embedding (combinatii ne-evidente). Nu sabloane.
+struct CreativeEngine {
+    vector<pair<int,int>> bridges(const GraphMemory& g,EmbeddingStore& es,float lo,float hi,int k){
+        vector<int> ns(g.nodes.begin(),g.nodes.end()); vector<pair<float,pair<int,int>>> cand;
+        auto conn=[&](int a,int b){ for(int ei:g.out(a)) if(g.edges[ei].dst==b)return true; return false; };
+        for(size_t i=0;i<ns.size();i++) for(size_t j=i+1;j<ns.size();j++){ if(conn(ns[i],ns[j])||conn(ns[j],ns[i]))continue;
+            float s=cosv(es.E[ns[i]],es.E[ns[j]]); if(s>lo&&s<hi) cand.push_back({s,{ns[i],ns[j]}}); }
+        sort(cand.begin(),cand.end(),[](const pair<float,pair<int,int>>&a,const pair<float,pair<int,int>>&b){return a.first>b.first;});
+        vector<pair<int,int>> r; for(int i=0;i<k&&i<(int)cand.size();i++)r.push_back(cand[i].second); return r;
+    }
 };
-// Call graph static: F -> G pentru fiecare apel din corpul lui F.
-struct CallGraph{ vector<Node>& A; map<string,set<string>> edges;
-    CallGraph(vector<Node>& a):A(a){}
-    void scan(const string& fn,int id){ Node& n=A[id]; if(n.k==N_CALL)edges[fn].insert(n.name);
-        for(int c:n.ch)scan(fn,c); }
-    int count(){ int e=0; for(auto&kv:edges)e+=kv.second.size(); return e; } };
-} // namespace Lang
+
 
 // ============================================================================
 //  MAIN — demo integrat (Parti 1-7) + analiza
@@ -1260,24 +1181,64 @@ int main(){
     { vector<int> path={tok.get("Ion"),tok.get("om"),tok.get("bani")};
       cout<<"   contradictie pe drum Ion->om->bani = "<<signContradiction(path,sw)<<" (0=consistent, 1=semn contradictoriu)\n"; }
 
-    // --- (f) LIMBAJ REAL: parser + tipuri + interpreter cu control-flow ---
-    cout<<"\n== (f) LIMBAJ REAL (parser + type unification + interpreter) ==\n";
+    // --- (f) PROGRAM LEARNING din TRACES de executie (sensor, fara keyword) ---
+    cout<<"\n== (f) PROGRAM LEARNING din TRACES (zero keyword-uri; descopera structura) ==\n";
     {
-        string prog =
-          "fn fact(n){ if (n < 2) { return 1; } return n * fact(n - 1); } "
-          "fn sumto(m){ let s = 0; let i = 1; while (i <= m) { s = s + i; i = i + 1; } return s; } "
-          "print fact(5); print sumto(5); let ok = 3 < 5; print ok;";
-        Lang::Lexer lx(prog); lx.lex();
-        vector<Lang::Node> A; vector<int> top; map<string,pair<vector<string>,int>> funcs;
-        Lang::Parser ps(lx.out,A,top,funcs); ps.parse();
-        Lang::Typer ty(A); for(int s:top) ty.walk(s);
-        Lang::CallGraph cg(A); for(auto& f:funcs) cg.scan(f.first,f.second.second);
-        Lang::Interp in(A,funcs); in.runTop(top);
-        cout<<"   AST noduri="<<A.size()<<", functii="<<funcs.size()<<", apeluri(call graph)="<<cg.count()
-            <<", erori de tip="<<ty.errors<<"\n";
-        cout<<"   call graph: "; for(auto&kv:cg.edges){ for(auto&g2:kv.second)cout<<kv.first<<"->"<<g2<<" "; } cout<<"\n";
-        cout<<"   EXECUTIE (fact(5), sumto(5), 3<5): "; for(auto& o:in.output)cout<<o<<" "; cout<<"\n";
-        cout<<"   (recursie + while + if + unificare de tipuri => limbaj real, nu jucarie)\n";
+        // simboluri OPACE s0,s1,s2 (sensorul nu le da niciun inteles). Generam
+        // traces dintr-un program ASCUNS (s=s+i; i=i+one). Invatatul vede DOAR valori.
+        vector<string> sn={"s0","s1","s2"}; int S=3;
+        vector<vector<map<int,double>>> traces;
+        for(int run=0;run<8;run++){ vector<map<int,double>> tr; double s=run,i=1,one=1;
+            for(int t=0;t<6;t++){ tr.push_back({{0,s},{1,i},{2,one}}); s=s+i; i=i+one; } traces.push_back(tr); }
+        TraceLearner tl; tl.learn(S,traces,600,0.02f);
+        cout<<"   variabile descoperite (valoare ne-constanta): "; for(int v:tl.varying)cout<<sn[v]<<" "; cout<<"\n";
+        cout<<"   functii de tranzitie descoperite (b <- a, coeficient):\n";
+        for(int b=0;b<S;b++) for(int a=0;a<S;a++){ float w=tl.coef[{a,b}]; if(fabs(w)>0.3f) cout<<"      "<<sn[b]<<"' <- "<<w<<"*"<<sn[a]<<"\n"; }
+        cout<<"   => a recuperat 's0'=s0+s1 si 's1'=s1+s2 DOAR din valori, fara sa parseze '+'.\n";
+    }
+
+    // --- (i) EFFECT MODES emergente (fara etichete increase/decrease/block) ---
+    cout<<"\n== (i) EFFECT MODES emergente (clustere de polaritate, numerice) ==\n";
+    { EffectModes em; em.discover(graph,sw);
+      cout<<"   moduri de efect descoperite: "<<em.nModes<<" (ex: E0 ~ creste, E1 ~ scade -- dar NUMERIC, fara nume in cod)\n";
+      for(int ei=0; ei<(int)graph.edges.size() && ei<6; ei++){ auto& e=graph.edges[ei];
+        cout<<"      "<<tok.name(e.src)<<"->"<<tok.name(e.dst)<<" : E"<<em.edgeMode[ei]<<" (w="<<sw.polarity(e.src,e.dst)<<")\n"; } }
+
+    // --- (j) TEMPORAL REASONING (ordine / lag / frecventa) ---
+    cout<<"\n== (j) TEMPORAL MODEL (proces temporal descoperit din secvente) ==\n";
+    { auto MK=[&](const string& w){ bool nw; vector<float> e; return eng.tok.getOrCreateToken(w,e,e,nw); };
+      vector<vector<int>> seqs;
+      seqs.push_back({MK("seminte"),MK("planta"),MK("fruct")});
+      seqs.push_back({MK("seminte"),MK("planta"),MK("fruct")});
+      seqs.push_back({MK("ou"),MK("pui"),MK("gaina")});
+      TemporalModel tm; tm.learn(seqs);
+      auto pr=tm.process(eng.tok.get("seminte"),4);
+      cout<<"   proces din 'seminte' (urmeaza succesorul cel mai frecvent la lag~1): ";
+      for(size_t i=0;i<pr.size();i++)cout<<(i?" -> ":"")<<eng.tok.name(pr[i]); cout<<"\n"; }
+
+    // --- (k) CREATIVE ENGINE (combinatii de concepte departate -> metafore) ---
+    cout<<"\n== (k) CREATIVE ENGINE (punti semantice intre noduri neconectate) ==\n";
+    { CreativeEngine ce; auto br=ce.bridges(graph,store,0.25f,0.9f,5);
+      if(br.empty())cout<<"   (nicio punte in pragul dat)\n";
+      for(auto& p:br) cout<<"      "<<tok.name(p.first)<<" ~ "<<tok.name(p.second)<<"  (cos="<<cosv(store.E[p.first],store.E[p.second])<<")\n"; }
+
+    // --- (l) NEXT-TOKEN INTEGRAT: graf + world-model + goal in ACELASI pas ---
+    cout<<"\n== (l) NEXT-TOKEN INTEGRAT (toate motoarele contribuie la un singur token) ==\n";
+    {
+        vector<string> nw; auto ctx=eng.tokenize("Ion",nw); vector<float> h=T.hiddenLast(ctx);
+        vector<float> qv=meanEmb(store,ctx,DEMO_D);
+        ActiveGraphState A; A.seed(ctx,1.f); A.expandTopK(graph,8);
+        vector<float> base=T.logitsCos(h), z=base; float bs=0;
+        eng.gbias.apply(z,A,qv,store,3.0f,2.0f,bs);                              // GRAF
+        { auto eff=sw.simulate(ctx.front(),1.f,4,graph);                        // WORLD MODEL
+          for(auto& kv:eff) if(kv.first>=0&&kv.first<(int)z.size()) z[kv.first]+=0.5f*tanh(kv.second); }
+        for(int v=0;v<(int)z.size();v++) z[v]+=0.4f*max(0.f,cosv(store.E[v],store.E[goalNode])); // GOAL
+        auto top5=[&](const vector<float>& zz){ vector<pair<float,int>> v; for(int i=0;i<(int)zz.size();i++)v.push_back({zz[i],i});
+            sort(v.begin(),v.end(),[](const pair<float,int>&a,const pair<float,int>&b){return a.first>b.first;});
+            for(int i=0;i<5&&i<(int)v.size();i++)cout<<tok.name(v[i].second)<<"("<<v[i].first<<") "; cout<<"\n"; };
+        cout<<"   logits TRANSFORMER pur          : "; top5(base);
+        cout<<"   + GRAF + WORLD-MODEL + GOAL     : "; top5(z);
+        cout<<"   (un singur pas de next-token, alimentat de toate motoarele simultan)\n";
     }
 
     // --- (g) CSR INCREMENTAL + (h) MMAP MUCHII zero-copy ---
