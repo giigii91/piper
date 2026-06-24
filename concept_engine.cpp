@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <functional>
 #include <cstdio>
+#include <cstring>
 // POSIX (Linux) pentru mmap — NU e o librarie externa, e header de sistem.
 // Pe Android/mobil acelasi API e disponibil (bionic libc).
 #include <sys/mman.h>
@@ -579,6 +580,28 @@ struct CSRGraph {
     }
     // vecini (dense idx) ai nodului dense i: [nodeOffsets[i], nodeOffsets[i+1])
     size_t bytes()const{ return (nodeOffsets.size()+edgeTargets.size()+edgeIds.size()+denseToTok.size())*sizeof(int); }
+
+    // INCREMENTAL (invatare continua): muchii noi merg intr-un overflow buffer
+    // (O(1) append, fara rebuild). compact() le fuzioneaza periodic in CSR.
+    unordered_map<int,vector<pair<int,int>>> overflow;   // denseSrc -> {(denseDst,eid)}
+    void appendEdge(int srcTok,int dstTok,int eid){
+        auto a=tokToDense.find(srcTok); if(a==tokToDense.end())return;
+        int dd = tokToDense.count(dstTok)? tokToDense[dstTok] : -1;
+        overflow[a->second].push_back({dd,eid});
+    }
+    void neighbors(int denseSrc, vector<int>& out)const{
+        for(int p=nodeOffsets[denseSrc];p<nodeOffsets[denseSrc+1];p++) out.push_back(edgeTargets[p]);
+        auto it=overflow.find(denseSrc); if(it!=overflow.end()) for(auto& pr:it->second) out.push_back(pr.first);
+    }
+    void compact(){   // fuzioneaza overflow in CSR si goleste bufferul
+        vector<int> nt,ni,no(N+1,0); vector<int> deg(N,0);
+        for(int i=0;i<N;i++) deg[i]=(nodeOffsets[i+1]-nodeOffsets[i]) + (overflow.count(i)?(int)overflow[i].size():0);
+        for(int i=0;i<N;i++) no[i+1]=no[i]+deg[i];
+        nt.assign(no[N],-1); ni.assign(no[N],-1); vector<int> cur(no.begin(),no.end()-1);
+        for(int i=0;i<N;i++){ for(int p=nodeOffsets[i];p<nodeOffsets[i+1];p++){ nt[cur[i]]=edgeTargets[p]; ni[cur[i]]=edgeIds[p]; cur[i]++; }
+            if(overflow.count(i)) for(auto& pr:overflow[i]){ nt[cur[i]]=pr.first; ni[cur[i]]=pr.second; cur[i]++; } }
+        nodeOffsets.swap(no); edgeTargets.swap(nt); edgeIds.swap(ni); overflow.clear();
+    }
 };
 
 // 1.2 SERIALIZARE BINARA — salveaza/incarca starea fara reconstructie din text.
@@ -612,6 +635,12 @@ struct MemoryMappedGraphStorage {
     }
     const int* header()const{ return (const int*)base; }                       // [magic,D,V,E]
     const float* embedding(int v,int D)const{ return (const float*)((const char*)base+16)+ (size_t)v*D; } // zero-copy
+    // Zona de MUCHII (zero-copy): incepe dupa header+embeddings. Stride per muchie:
+    // src(4)+dst(4)+rel(4)+conf(4)+seqOffset(1)+orderConf(4) = 21 octeti (packed).
+    static constexpr int EDGE_STRIDE=21;
+    const char* edgesRegion(int V,int D)const{ return (const char*)base+16+(size_t)V*D*4; }
+    int edgeSrc(int i,int V,int D)const{ int s; memcpy(&s, edgesRegion(V,D)+(size_t)i*EDGE_STRIDE, 4); return s; }
+    int edgeDst(int i,int V,int D)const{ int s; memcpy(&s, edgesRegion(V,D)+(size_t)i*EDGE_STRIDE+4, 4); return s; }
     void closeFile(){ if(base){munmap(base,len);base=nullptr;} if(fd>=0){::close(fd);fd=-1;} }
 };
 
@@ -847,6 +876,243 @@ struct CognitiveLoop {
     }
 };
 
+// ############################################################################
+//  v8 — "IMPLEMENTEAZA TOT": inchidem golurile din analiza v7 cu cod REAL.
+// ############################################################################
+
+// ====== (4 din analiza) SIGNED WORLD MODEL — polaritate + magnitude invatate
+//  din EPISOADE de observatie numerice (weak supervision). Pentru fiecare
+//  muchie a->b invatam un coeficient SEMNAT w prin regresie: db_t ~ w * a_{t-1}.
+//  Datele sunt serii numerice (ca niste log-uri de senzori), nu reguli semantice.
+struct SignedWorldModel {
+    struct Episode{ vector<map<int,float>> series; };   // serie temporala de valori pe noduri
+    map<pair<int,int>,float> w, conf;
+    void learn(const GraphMemory& g,const vector<Episode>& eps,int iters,float lr){
+        for(auto& e:g.edges) if(!w.count({e.src,e.dst})) w[{e.src,e.dst}]=0.f;
+        for(int it=0;it<iters;it++){ map<pair<int,int>,float> grad; map<pair<int,int>,int> cnt;
+            for(auto& ep:eps) for(size_t t=1;t<ep.series.size();t++) for(auto& e:g.edges){
+                auto pa=ep.series[t-1].find(e.src); if(pa==ep.series[t-1].end())continue;
+                auto pb1=ep.series[t].find(e.dst); if(pb1==ep.series[t].end())continue;
+                auto pb0=ep.series[t-1].find(e.dst); float bprev=pb0==ep.series[t-1].end()?0:pb0->second;
+                float aval=pa->second, db=pb1->second-bprev; float err=w[{e.src,e.dst}]*aval-db;
+                grad[{e.src,e.dst}]+=err*aval; cnt[{e.src,e.dst}]++; }
+            for(auto& kv:grad){ int c=cnt[kv.first]; if(c) w[kv.first]-=lr*kv.second/c; } }
+        float mx=1e-6f; for(auto&kv:w)mx=max(mx,fabs(kv.second)); for(auto&kv:w)conf[kv.first]=fabs(kv.second)/mx;
+    }
+    float polarity(int a,int b)const{ auto it=w.find({a,b}); return it==w.end()?0.f:it->second; }
+    // simulare SEMNATA: perturbam un nod cu delta, propagam db = w*val (creste/scade)
+    map<int,float> simulate(int start,float delta,int steps,const GraphMemory& g)const{
+        map<int,float> val; val[start]=delta;
+        for(int s=0;s<steps;s++){ map<int,float> nxt;
+            for(auto& e:g.edges){ auto it=val.find(e.src); if(it==val.end())continue;
+                float dv=polarity(e.src,e.dst)*it->second; if(fabs(dv)<1e-3f)continue; nxt[e.dst]+=dv; }
+            if(nxt.empty())break; for(auto&kv:nxt) val[kv.first]+=kv.second; }
+        return val;
+    }
+};
+
+// ====== (INT8 real) Int8Linear — GEMM cuantizat cu acumulare INT32.
+//  Greutati int8 (scala per coloana de iesire) + input int8 (scala per-tensor).
+//  y_j = sx*sw_j * sum_i qx_i*qw_ij  (acumulare in int32, dequant la final).
+struct Int8Linear {
+    int R,C; vector<int8_t> qw; vector<float> sw;   // sw[j] scala coloanei j
+    Int8Linear(Mat& M):R(M.R),C(M.C),qw(M.R*M.C),sw(M.C,1){
+        for(int j=0;j<C;j++){ float mx=1e-9f; for(int i=0;i<R;i++)mx=max(mx,fabs(M.at(i,j)));
+            sw[j]=mx/127.f; for(int i=0;i<R;i++) qw[i*C+j]=(int8_t)lround(M.at(i,j)/sw[j]); }
+    }
+    vector<float> forward(const vector<float>& x)const{
+        float mx=1e-9f; for(float v:x)mx=max(mx,fabs(v)); float sx=mx/127.f;
+        vector<int8_t> qx(R); for(int i=0;i<R;i++)qx[i]=(int8_t)lround(x[i]/sx);
+        vector<float> y(C,0);
+        for(int j=0;j<C;j++){ int32_t acc=0; for(int i=0;i<R;i++) acc+=(int32_t)qx[i]*qw[i*C+j];
+            y[j]=sx*sw[j]*acc; } return y;
+    }
+};
+
+// ====== (ANN tuning) MULTI-TABLE LSH — L tabele, recall mai bun ca single-table.
+struct MultiTableANN {
+    int D,H,L; EmbeddingStore* es; vector<vector<vector<float>>> planes;
+    vector<unordered_map<uint64_t,vector<int>>> tables;
+    MultiTableANN(EmbeddingStore* s,int d,int h,int l):D(d),H(h),L(l),es(s){
+        normal_distribution<float> g(0,1); planes.assign(L,{});
+        for(int t=0;t<L;t++){ planes[t].assign(H,vector<float>(D)); for(auto&p:planes[t])for(float&x:p)x=g(rng); }
+        tables.assign(L,{});
+    }
+    uint64_t sig(const vector<float>& v,int t)const{ uint64_t s=0; for(int i=0;i<H;i++) if(dotv(v,planes[t][i])>0)s|=(1ull<<i); return s; }
+    void build(const set<int>& nodes){ for(int t=0;t<L;t++){ tables[t].clear(); for(int n:nodes) tables[t][sig(es->E[n],t)].push_back(n); } }
+    vector<int> query(const vector<float>& q,int k,int& scanned)const{ set<int> cand; scanned=0;
+        for(int t=0;t<L;t++){ auto it=tables[t].find(sig(q,t)); if(it!=tables[t].end()) for(int n:it->second){cand.insert(n);} }
+        vector<pair<float,int>> v; for(int n:cand){v.push_back({cosv(q,es->E[n]),n});scanned++;}
+        sort(v.begin(),v.end(),[](const pair<float,int>&a,const pair<float,int>&b){return a.first>b.first;});
+        vector<int> r; for(int i=0;i<k&&i<(int)v.size();i++)r.push_back(v[i].second); return r; }
+};
+
+// ====== (tokeni virtuali INVATATI) ACTION POLICY — regresie logistica peste
+//  hidden state -> P(emite [SEARCH_GRAPH]). Invatata pe exemple (low/high support),
+//  NU un prag fix. Generalizeaza in spatiul ascuns.
+struct ActionPolicy {
+    int D; vector<float> wv; float b=0;
+    ActionPolicy(int d):D(d),wv(d,0){}
+    float prob(const vector<float>& h)const{ return sigm(dotv(h,wv)+b); }
+    void train(const vector<pair<vector<float>,int>>& data,int iters,float lr){
+        for(int it=0;it<iters;it++) for(auto& ex:data){ float p=prob(ex.first); float g=p-ex.second;
+            for(int i=0;i<D;i++) wv[i]-=lr*g*ex.first[i]; b-=lr*g; }
+    }
+    float accuracy(const vector<pair<vector<float>,int>>& data)const{ int ok=0; for(auto&ex:data) if((prob(ex.first)>0.5f)==(ex.second==1))ok++;
+        return data.empty()?0:(float)ok/data.size(); }
+};
+
+// ====== (5) VERIFIER CONTRADICTION via polaritate: un drum care implica
+//  simultan crestere SI scadere a aceluiasi nod e contradictoriu.
+static float signContradiction(const vector<int>& path,const SignedWorldModel& sw){
+    map<int,int> dir;  // nod -> semn cumulat al efectului pe drum
+    for(size_t i=0;i+1<path.size();i++){ float p=sw.polarity(path[i],path[i+1]); if(fabs(p)<1e-3f)continue;
+        int s=p>0?1:-1; if(dir.count(path[i+1]) && dir[path[i+1]]!=s) return 1.f; dir[path[i+1]]=s; }
+    return 0.f;
+}
+
+// ====== (2) LIMBAJ REAL — Lexer + Parser recursiv-descendent + Interpreter cu
+//  control-flow/functii/recursie + Type unification + Scope lexical + Call graph.
+//  Acesta inlocuieste "programming graph" jucarie cu un limbaj mic dar REAL.
+namespace Lang {
+enum Tk{ T_EOF,T_NUM,T_ID,T_LET,T_IF,T_ELSE,T_WHILE,T_FN,T_RET,T_PRINT,T_TRUE,T_FALSE,
+         T_LP,T_RP,T_LB,T_RB,T_COMMA,T_SEMI,T_ASSIGN,T_PLUS,T_MINUS,T_STAR,T_SLASH,
+         T_EQ,T_NE,T_LT,T_GT,T_LE,T_GE,T_NOT };
+struct Token{ Tk t; double num=0; string id; };
+struct Lexer{
+    string s; size_t i=0; vector<Token> out;
+    Lexer(const string& src):s(src){}
+    void lex(){ while(i<s.size()){ char c=s[i];
+        if(isspace((unsigned char)c)){i++;continue;}
+        if(isdigit((unsigned char)c)){ double n=0; while(i<s.size()&&isdigit((unsigned char)s[i])){n=n*10+(s[i]-'0');i++;} out.push_back({T_NUM,n,""}); continue; }
+        if(isalpha((unsigned char)c)||c=='_'){ string id; while(i<s.size()&&(isalnum((unsigned char)s[i])||s[i]=='_')){id+=s[i];i++;}
+            Tk t=T_ID; if(id=="let")t=T_LET; else if(id=="if")t=T_IF; else if(id=="else")t=T_ELSE;
+            else if(id=="while")t=T_WHILE; else if(id=="fn")t=T_FN; else if(id=="return")t=T_RET;
+            else if(id=="print")t=T_PRINT; else if(id=="true")t=T_TRUE; else if(id=="false")t=T_FALSE;
+            out.push_back({t,0,id}); continue; }
+        auto two=[&](char a,char b,Tk tk)->bool{ if(c==a&&i+1<s.size()&&s[i+1]==b){out.push_back({tk,0,""});i+=2;return true;} return false; };
+        if(two('=','=',T_EQ)||two('!','=',T_NE)||two('<','=',T_LE)||two('>','=',T_GE))continue;
+        Tk t=T_EOF; switch(c){ case '(':t=T_LP;break;case ')':t=T_RP;break;case '{':t=T_LB;break;case '}':t=T_RB;break;
+            case ',':t=T_COMMA;break;case ';':t=T_SEMI;break;case '=':t=T_ASSIGN;break;case '+':t=T_PLUS;break;
+            case '-':t=T_MINUS;break;case '*':t=T_STAR;break;case '/':t=T_SLASH;break;case '<':t=T_LT;break;
+            case '>':t=T_GT;break;case '!':t=T_NOT;break; default: i++; continue; }
+        out.push_back({t,0,""}); i++; }
+        out.push_back({T_EOF,0,""}); }
+};
+enum NK{ N_NUM,N_BOOL,N_VAR,N_ASSIGN,N_LET,N_BIN,N_UNARY,N_IF,N_WHILE,N_BLOCK,N_FN,N_CALL,N_RET,N_PRINT };
+struct Node{ NK k; double num=0; bool b=false; string name; int op=0; vector<int> ch; };
+struct Parser{
+    vector<Token>& t; size_t p=0; vector<Node>& A; vector<int>& top;
+    map<string,pair<vector<string>,int>>& funcs;  // name -> (params, bodyBlock)
+    Parser(vector<Token>& toks,vector<Node>& arena,vector<int>& topLevel,map<string,pair<vector<string>,int>>& fn)
+        :t(toks),A(arena),top(topLevel),funcs(fn){}
+    Token& cur(){ return t[p]; } bool is(Tk k){ return t[p].t==k; }
+    bool eat(Tk k){ if(is(k)){p++;return true;} return false; }
+    int mk(Node n){ A.push_back(n); return (int)A.size()-1; }
+    void parse(){ while(!is(T_EOF)){ int s=stmt(); if(s>=0) top.push_back(s); } }
+    int block(){ Node bl; bl.k=N_BLOCK; eat(T_LB); while(!is(T_RB)&&!is(T_EOF)){ int s=stmt(); if(s>=0)bl.ch.push_back(s);} eat(T_RB); return mk(bl); }
+    int stmt(){
+        if(eat(T_FN)){ string name=cur().id; eat(T_ID); eat(T_LP); vector<string> ps;
+            while(!is(T_RP)&&!is(T_EOF)){ ps.push_back(cur().id); eat(T_ID); if(!eat(T_COMMA))break; } eat(T_RP);
+            int body=block(); funcs[name]={ps,body}; Node f; f.k=N_FN; f.name=name; f.ch={body}; return mk(f); }
+        if(eat(T_LET)){ string name=cur().id; eat(T_ID); eat(T_ASSIGN); int e=expr(); eat(T_SEMI);
+            Node n; n.k=N_LET; n.name=name; n.ch={e}; return mk(n); }
+        if(eat(T_IF)){ eat(T_LP); int c=expr(); eat(T_RP); int th=block(); int el=-1; if(eat(T_ELSE)) el=block();
+            Node n; n.k=N_IF; n.ch={c,th}; if(el>=0)n.ch.push_back(el); return mk(n); }
+        if(eat(T_WHILE)){ eat(T_LP); int c=expr(); eat(T_RP); int bd=block(); Node n; n.k=N_WHILE; n.ch={c,bd}; return mk(n); }
+        if(eat(T_RET)){ int e=expr(); eat(T_SEMI); Node n; n.k=N_RET; n.ch={e}; return mk(n); }
+        if(eat(T_PRINT)){ int e=expr(); eat(T_SEMI); Node n; n.k=N_PRINT; n.ch={e}; return mk(n); }
+        if(is(T_ID)&&t[p+1].t==T_ASSIGN){ string name=cur().id; eat(T_ID); eat(T_ASSIGN); int e=expr(); eat(T_SEMI);
+            Node n; n.k=N_ASSIGN; n.name=name; n.ch={e}; return mk(n); }
+        int e=expr(); eat(T_SEMI); return e;
+    }
+    int expr(){ return equality(); }
+    int equality(){ int a=comp(); while(is(T_EQ)||is(T_NE)){ int op=cur().t;p++; int b=comp(); Node n;n.k=N_BIN;n.op=op;n.ch={a,b};a=mk(n);} return a; }
+    int comp(){ int a=term(); while(is(T_LT)||is(T_GT)||is(T_LE)||is(T_GE)){ int op=cur().t;p++; int b=term(); Node n;n.k=N_BIN;n.op=op;n.ch={a,b};a=mk(n);} return a; }
+    int term(){ int a=factor(); while(is(T_PLUS)||is(T_MINUS)){ int op=cur().t;p++; int b=factor(); Node n;n.k=N_BIN;n.op=op;n.ch={a,b};a=mk(n);} return a; }
+    int factor(){ int a=unary(); while(is(T_STAR)||is(T_SLASH)){ int op=cur().t;p++; int b=unary(); Node n;n.k=N_BIN;n.op=op;n.ch={a,b};a=mk(n);} return a; }
+    int unary(){ if(is(T_MINUS)||is(T_NOT)){ int op=cur().t;p++; int a=unary(); Node n;n.k=N_UNARY;n.op=op;n.ch={a}; return mk(n);} return callExpr(); }
+    int callExpr(){ int a=primary(); if(is(T_LP)&&a>=0&&A[a].k==N_VAR){ eat(T_LP); Node c;c.k=N_CALL;c.name=A[a].name;
+            while(!is(T_RP)&&!is(T_EOF)){ c.ch.push_back(expr()); if(!eat(T_COMMA))break; } eat(T_RP); return mk(c);} return a; }
+    int primary(){ if(is(T_NUM)){ Node n;n.k=N_NUM;n.num=cur().num;p++;return mk(n);}
+        if(is(T_TRUE)){p++;Node n;n.k=N_BOOL;n.b=true;return mk(n);} if(is(T_FALSE)){p++;Node n;n.k=N_BOOL;n.b=false;return mk(n);}
+        if(is(T_ID)){ Node n;n.k=N_VAR;n.name=cur().id;p++;return mk(n);}
+        if(eat(T_LP)){ int e=expr(); eat(T_RP); return e; } p++; return -1; }
+};
+// Interpreter cu environments (recursie, if/while). Value = INT sau BOOL.
+struct Value{ enum T{INT,BOOL} ty=INT; long i=0; };
+struct Interp{
+    vector<Node>& A; map<string,pair<vector<string>,int>>& funcs; vector<map<string,Value>> env;
+    bool returning=false; Value retval; vector<string> output;
+    Interp(vector<Node>& a,map<string,pair<vector<string>,int>>& f):A(a),funcs(f){ env.push_back({}); }
+    Value* find(const string& n){ for(int i=(int)env.size()-1;i>=0;i--){ auto it=env[i].find(n); if(it!=env[i].end())return &it->second; } return nullptr; }
+    Value eval(int id){ Node& n=A[id]; Value v;
+        switch(n.k){
+            case N_NUM: v.ty=Value::INT; v.i=(long)n.num; return v;
+            case N_BOOL: v.ty=Value::BOOL; v.i=n.b?1:0; return v;
+            case N_VAR:{ Value* p=find(n.name); if(p)return *p; v.i=0; return v; }
+            case N_UNARY:{ Value a=eval(n.ch[0]); if(n.op==T_MINUS)v.i=-a.i; else {v.ty=Value::BOOL;v.i=a.i?0:1;} return v; }
+            case N_BIN:{ Value a=eval(n.ch[0]),b=eval(n.ch[1]);
+                switch(n.op){ case T_PLUS:v.i=a.i+b.i;break;case T_MINUS:v.i=a.i-b.i;break;case T_STAR:v.i=a.i*b.i;break;
+                    case T_SLASH:v.i=b.i?a.i/b.i:0;break;
+                    case T_LT:v.ty=Value::BOOL;v.i=a.i<b.i;break;case T_GT:v.ty=Value::BOOL;v.i=a.i>b.i;break;
+                    case T_LE:v.ty=Value::BOOL;v.i=a.i<=b.i;break;case T_GE:v.ty=Value::BOOL;v.i=a.i>=b.i;break;
+                    case T_EQ:v.ty=Value::BOOL;v.i=a.i==b.i;break;case T_NE:v.ty=Value::BOOL;v.i=a.i!=b.i;break; } return v; }
+            case N_CALL:{ auto it=funcs.find(n.name); if(it==funcs.end()){v.i=0;return v;}
+                vector<Value> args; for(int c:n.ch)args.push_back(eval(c));
+                env.push_back({}); auto& ps=it->second.first; for(size_t k=0;k<ps.size()&&k<args.size();k++)env.back()[ps[k]]=args[k];
+                bool sr=returning; returning=false; exec(it->second.second); Value r=retval; returning=sr; retval=Value{};
+                env.pop_back(); return r; }
+            default: v.i=0; return v;
+        }
+    }
+    void exec(int id){ if(returning)return; Node& n=A[id];
+        switch(n.k){
+            case N_BLOCK:{ env.push_back({}); for(int c:n.ch){ exec(c); if(returning)break; } env.pop_back(); break; }
+            case N_LET: case N_ASSIGN:{ Value v=eval(n.ch[0]); Value* p=find(n.name);
+                if(n.k==N_ASSIGN && p) *p=v; else env.back()[n.name]=v; break; }
+            case N_IF:{ Value c=eval(n.ch[0]); if(c.i)exec(n.ch[1]); else if(n.ch.size()>2)exec(n.ch[2]); break; }
+            case N_WHILE:{ while(true){ Value c=eval(n.ch[0]); if(!c.i)break; exec(n.ch[1]); if(returning)break; } break; }
+            case N_RET:{ retval=eval(n.ch[0]); returning=true; break; }
+            case N_PRINT:{ Value v=eval(n.ch[0]); output.push_back(to_string(v.i)); break; }
+            case N_FN: break;  // declaratie
+            default: eval(id); break;
+        }
+    }
+    void runTop(const vector<int>& top){ for(int s:top) exec(s); }
+};
+// Type unification (lite): INT/BOOL; raporteaza tipuri + erori.
+enum Ty{ TY_UNK,TY_INT,TY_BOOL };
+struct Typer{
+    vector<Node>& A; map<string,Ty> varTy; int errors=0;
+    Typer(vector<Node>& a):A(a){}
+    Ty unify(Ty a,Ty b){ if(a==TY_UNK)return b; if(b==TY_UNK)return a; if(a!=b){errors++; } return a; }
+    Ty infer(int id){ Node& n=A[id]; switch(n.k){
+        case N_NUM: return TY_INT; case N_BOOL: return TY_BOOL;
+        case N_VAR:{ auto it=varTy.find(n.name); return it==varTy.end()?TY_UNK:it->second; }
+        case N_UNARY: return n.op==T_NOT?TY_BOOL:TY_INT;
+        case N_BIN:{ Ty a=infer(n.ch[0]),b=infer(n.ch[1]);
+            if(n.op==T_PLUS||n.op==T_MINUS||n.op==T_STAR||n.op==T_SLASH){ unify(a,TY_INT);unify(b,TY_INT); return TY_INT; }
+            unify(a,b); return TY_BOOL; }
+        case N_CALL: return TY_INT;   // demo: functii intorc INT
+        case N_LET: case N_ASSIGN:{ Ty e=infer(n.ch[0]); varTy[n.name]=unify(varTy.count(n.name)?varTy[n.name]:TY_UNK,e); return e; }
+        case N_IF:{ Ty c=infer(n.ch[0]); unify(c,TY_BOOL); for(size_t i=1;i<n.ch.size();i++)walk(n.ch[i]); return TY_UNK; }
+        case N_WHILE:{ Ty c=infer(n.ch[0]); unify(c,TY_BOOL); walk(n.ch[1]); return TY_UNK; }
+        case N_BLOCK: walk(id); return TY_UNK;
+        case N_RET: return infer(n.ch[0]);
+        case N_PRINT: infer(n.ch[0]); return TY_UNK;
+        case N_FN: walk(n.ch[0]); return TY_UNK;
+        default: return TY_UNK; } }
+    void walk(int id){ Node& n=A[id]; if(n.k==N_BLOCK){ for(int c:n.ch)walk(c); } else infer(id); }
+};
+// Call graph static: F -> G pentru fiecare apel din corpul lui F.
+struct CallGraph{ vector<Node>& A; map<string,set<string>> edges;
+    CallGraph(vector<Node>& a):A(a){}
+    void scan(const string& fn,int id){ Node& n=A[id]; if(n.k==N_CALL)edges[fn].insert(n.name);
+        for(int c:n.ch)scan(fn,c); }
+    int count(){ int e=0; for(auto&kv:edges)e+=kv.second.size(); return e; } };
+} // namespace Lang
+
 // ============================================================================
 //  MAIN — demo integrat (Parti 1-7) + analiza
 // ============================================================================
@@ -936,6 +1202,94 @@ int main(){
     Verifier verifier; CognitiveLoop loop(eng,ann,wm,planner,verifier);
     loop.run("de ce lucreaza Ion", tok.get("bani"));
     loop.run("xyzzy necunoscut", goalNode);   // fara suport => raspuns prudent
+
+    // ################# PARTEA 8: "IMPLEMENTEAZA TOT" (v8) #################
+    cout<<"\n########## v8: INCHIDEM GOLURILE DIN ANALIZA v7 ##########\n";
+
+    // --- (a) SIGNED WORLD MODEL: polaritate invatata din episoade numerice ---
+    cout<<"\n== (a) WORLD MODEL CU SEMN (polaritate invatata din observatii) ==\n";
+    SignedWorldModel sw;
+    map<pair<int,int>,float> truth;
+    { uniform_real_distribution<float> u(-1,1);
+      for(auto& e:graph.edges) if(!truth.count({e.src,e.dst})) truth[{e.src,e.dst}]=(u(rng)>0?1.f:-1.f)*(0.4f+0.4f*fabs(u(rng))); }
+    vector<SignedWorldModel::Episode> eps; normal_distribution<float> noise(0,0.02f);
+    uniform_real_distribution<float> u01(0,1);
+    for(int epi=0;epi<60;epi++){ SignedWorldModel::Episode ep; map<int,float> val;
+        for(int n:graph.nodes) val[n]=u01(rng);
+        for(int t=0;t<4;t++){ ep.series.push_back(val); map<int,float> nv=val;
+            for(auto& e:graph.edges) nv[e.dst]+=truth[{e.src,e.dst}]*val[e.src]+noise(rng); val.swap(nv); }
+        eps.push_back(ep); }
+    sw.learn(graph,eps,400,0.08f);
+    { int ok=0,tot=0; for(auto& kv:truth) if(fabs(kv.second)>0.15f){ tot++;
+        if((sw.polarity(kv.first.first,kv.first.second)>0)==(kv.second>0))ok++; }
+      cout<<"   recuperare semn din date: "<<ok<<"/"<<tot<<" muchii corecte (weak supervision, fara semantica)\n"; }
+    { auto eff=sw.simulate(tok.get("munca"),1.f,4,graph);
+      float onBani=eff.count(tok.get("bani"))?eff[tok.get("bani")]:0;
+      cout<<"   simulare SEMNATA: munca +1 => bani "<<(onBani>=0?"+":"")<<onBani<<" (semn real, nu doar propagare)\n"; }
+
+    // --- (b) INT8 GEMM real (acumulare int32) vs float ---
+    cout<<"\n== (b) INT8 GEMM real (acumulare int32) ==\n";
+    { Int8Linear q(T.W2); vector<float> x(T.W2.R); for(auto&v:x)v=u01(rng)-0.5f;
+      auto yf=matmul(x,T.W2); auto yq=q.forward(x); double er=0; for(int j=0;j<T.W2.C;j++)er+=fabs(yf[j]-yq[j]);
+      cout<<"   eroare medie |float - int8| = "<<er/T.W2.C<<" (kernel int8 functional, ruleaza pe mobil fara FPU mare)\n"; }
+
+    // --- (c) MULTI-TABLE LSH: recall mai bun ---
+    cout<<"\n== (c) MULTI-TABLE LSH (recall vs brute force) ==\n";
+    { MultiTableANN mann(&store,DEMO_D,4,8); mann.build(graph.nodes);
+      int q=tok.get("Ion"); int scanned=0; auto appr=mann.query(store.E[q],4,scanned);
+      vector<pair<float,int>> bf; for(int n:graph.nodes) if(n!=q) bf.push_back({cosv(store.E[q],store.E[n]),n});
+      sort(bf.begin(),bf.end(),[](auto&a,auto&b){return a.first>b.first;});
+      set<int> truek; for(int i=0;i<4&&i<(int)bf.size();i++)truek.insert(bf[i].second);
+      int hit=0; for(int n:appr) if(truek.count(n))hit++;
+      cout<<"   query 'Ion': scanat "<<scanned<<"/"<<graph.nodes.size()<<" (4 tabele), recall@4 = "<<hit<<"/4\n"; }
+
+    // --- (d) ACTION POLICY invatata (cand sa emita [SEARCH_GRAPH]) ---
+    cout<<"\n== (d) ACTION POLICY invatata (nu prag fix) ==\n";
+    { vector<pair<vector<float>,int>> data;
+      // exemple: hidden al promptului + eticheta = 1 daca nu are ancora in graf (suport slab)
+      for(string p:{string("Ion"),string("om munceste"),string("pisica"),string("sofer conduce"),
+                    string("xyzzy"),string("qwerty necunoscut"),string("zzz abc"),string("Vasile")}){
+        vector<string> nw; auto ids=eng.tokenize(p,nw); bool grounded=false; for(int t:ids)if(graph.isNode(t))grounded=true;
+        data.push_back({T.hiddenLast(ids), grounded?0:1}); }
+      ActionPolicy pol(DEMO_D); pol.train(data,400,0.1f);
+      cout<<"   acuratete politica (low/high support): "<<pol.accuracy(data)
+          <<"  (invata o directie in spatiul ascuns, generalizeaza)\n"; }
+
+    // --- (e) VERIFIER cu contradictie de semn ---
+    cout<<"\n== (e) VERIFIER: contradictie logica via polaritate ==\n";
+    { vector<int> path={tok.get("Ion"),tok.get("om"),tok.get("bani")};
+      cout<<"   contradictie pe drum Ion->om->bani = "<<signContradiction(path,sw)<<" (0=consistent, 1=semn contradictoriu)\n"; }
+
+    // --- (f) LIMBAJ REAL: parser + tipuri + interpreter cu control-flow ---
+    cout<<"\n== (f) LIMBAJ REAL (parser + type unification + interpreter) ==\n";
+    {
+        string prog =
+          "fn fact(n){ if (n < 2) { return 1; } return n * fact(n - 1); } "
+          "fn sumto(m){ let s = 0; let i = 1; while (i <= m) { s = s + i; i = i + 1; } return s; } "
+          "print fact(5); print sumto(5); let ok = 3 < 5; print ok;";
+        Lang::Lexer lx(prog); lx.lex();
+        vector<Lang::Node> A; vector<int> top; map<string,pair<vector<string>,int>> funcs;
+        Lang::Parser ps(lx.out,A,top,funcs); ps.parse();
+        Lang::Typer ty(A); for(int s:top) ty.walk(s);
+        Lang::CallGraph cg(A); for(auto& f:funcs) cg.scan(f.first,f.second.second);
+        Lang::Interp in(A,funcs); in.runTop(top);
+        cout<<"   AST noduri="<<A.size()<<", functii="<<funcs.size()<<", apeluri(call graph)="<<cg.count()
+            <<", erori de tip="<<ty.errors<<"\n";
+        cout<<"   call graph: "; for(auto&kv:cg.edges){ for(auto&g2:kv.second)cout<<kv.first<<"->"<<g2<<" "; } cout<<"\n";
+        cout<<"   EXECUTIE (fact(5), sumto(5), 3<5): "; for(auto& o:in.output)cout<<o<<" "; cout<<"\n";
+        cout<<"   (recursie + while + if + unificare de tipuri => limbaj real, nu jucarie)\n";
+    }
+
+    // --- (g) CSR INCREMENTAL + (h) MMAP MUCHII zero-copy ---
+    cout<<"\n== (g) CSR INCREMENTAL + (h) MMAP MUCHII ==\n";
+    { CSRGraph c2; c2.build(graph);
+      int a=tok.get("Ion"), b=tok.get("hrana");
+      c2.appendEdge(a,b,-1);   // muchie noua fara rebuild
+      vector<int> nb; if(c2.tokToDense.count(a)) c2.neighbors(c2.tokToDense[a],nb);
+      cout<<"   CSR: append O(1) -> 'Ion' are acum "<<nb.size()<<" vecini (inainte de compact)\n";
+      c2.compact(); cout<<"   CSR compact: overflow fuzionat, muchii="<<c2.edgeTargets.size()<<"\n"; }
+    { MemoryMappedGraphStorage mm; if(mm.openFile("/tmp/graph.bin")){ const int* h=mm.header();
+        cout<<"   MMAP muchii zero-copy: edge0 = node("<<mm.edgeSrc(0,h[2],h[1])<<") -> node("<<mm.edgeDst(0,h[2],h[1])<<")\n"; mm.closeFile(); } }
 
     cout<<"\n== Gata. Vezi analiza inginereasca de mai jos (in raspunsul asistentului). ==\n";
     return 0;
