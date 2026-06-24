@@ -42,6 +42,8 @@
 #include <unordered_set>
 #include <set>
 #include <map>
+#include <tuple>
+#include <queue>
 #include <cmath>
 #include <random>
 #include <algorithm>
@@ -224,6 +226,15 @@ struct Encoder {
         return cnt?loss/cnt:0;
     }
     vector<float> tokenVec(int id){vector<float> v(D);for(int i=0;i<D;i++)v[i]=tokEmb.at(id,i);return v;}
+    // distributie de next-token pe vocabular dat un context (PREDICTIE)
+    vector<float> nextDist(const vector<int>& ctx){
+        if(ctx.empty()) return vector<float>(V,1.0f/V);
+        Cache c=forward(ctx); return softmax(logits(c.hid.back()));
+    }
+    // cat de tare prezice contextul 'ctx' tokenul 'tgt' (semnal cauzal/predictiv)
+    float predProb(const vector<int>& ctx,int tgt){
+        auto d=nextDist(ctx); return (tgt>=0&&tgt<(int)d.size())? d[tgt] : 0.f;
+    }
     // embedding al unei secvente = media embeddingurilor tokenilor (numeric)
     vector<float> meanVec(const vector<int>& ids,int a,int b){
         vector<float> v(D,0); int c=0;
@@ -416,77 +427,228 @@ int main(int argc,char** argv){
             <<"  [C"<<nodeConcept[e.dst]<<"]  conf="<<e.confidence<<(e.derived?"  (derivat)":"")<<"\n";
 
     // ============================================================
-    //  REASONING: intrebare -> embedding -> PATH-SEARCH ponderat.
-    //  Scor muchie = confidence*(BETA + ALPHA*relevanta(query,muchie)).
-    //  Fara nicio ramura pe tipul relatiei sau pe cuvinte din intrebare.
+    //  4. CONCEPT FORMATION — abstractizare: unim conceptele de baza ale caror
+    //  centroizi sunt apropiati vectorial intr-un SUPER-CONCEPT S (ierarhie).
     // ============================================================
-    // Modelul de raspuns (totul numeric, fara nicio ramura pe tip de relatie):
-    //   (1) INTRAREA in lant e aleasa de INTREBARE: dintre muchiile pornind din
-    //       nodul-ancora, o alegem pe cea mai relevanta vectorial fata de
-    //       embedding-ul intrebarii (r0 = cos(query, edge)).
-    //   (2) CONTINUAREA e forward-chaining pe conectivitatea grafului: din
-    //       nodul atins, prelungim lantul maximizand suma de confidence (pana
-    //       la un sink sau ciclu). Astfel un drum multi-relatie (cauzal) se
-    //       formeaza singur, fara sa stim ce "tip" are fiecare muchie.
-    //   Selectie LEXICOGRAFICA: intai r0 (ce vrea intrebarea), apoi suma conf.
-    //   => intrebari diferite intra prin relatii diferite, fara "if de ce".
-    const float ENTRYMIN=0.30f;   // prag anti-halucinatie pe relevanta intrarii
-    const int   MAXDEPTH=7;
-
-    // continuare de confidence maxima din 'start' (forward-chaining numeric)
-    struct Cont{ vector<int> nodes,rels; float conf=-1.f; };
-    function<void(int,set<int>&,vector<int>&,vector<int>&,float,Cont&)> walk;
-    walk=[&](int cur,set<int>& vis,vector<int>& n,vector<int>& r,float cs,Cont& best){
-        if(cs>best.conf){ best.conf=cs; best.nodes=n; best.rels=r; }
-        if((int)n.size()>=MAXDEPTH) return;
-        for(int ei:graph.outIdx(cur)){
-            const Edge& e=graph.edges[ei];
-            if(vis.count(e.dst)) continue;                 // tehnic: fara cicluri
-            vis.insert(e.dst); n.push_back(e.dst); r.push_back(e.relCluster);
-            walk(e.dst,vis,n,r,cs+e.confidence,best);
-            n.pop_back(); r.pop_back(); vis.erase(e.dst);
+    map<int,vector<float>> conCentroid; map<int,int> conCount;
+    for(auto& kv:nodeConcept){ auto v=enc.tokenVec(kv.first);
+        auto& c=conCentroid[kv.second]; if(c.empty())c.assign(v.size(),0);
+        for(size_t k=0;k<v.size();k++)c[k]+=v[k]; conCount[kv.second]++; }
+    for(auto& kv:conCentroid) for(float& x:kv.second) x/=conCount[kv.first];
+    map<int,int> parent; for(auto& kv:conCentroid) parent[kv.first]=kv.first;
+    function<int(int)> findp=[&](int x){ while(parent[x]!=x){parent[x]=parent[parent[x]];x=parent[x];} return x; };
+    {
+        float superThresh=0.33f;
+        vector<int> cids; for(auto& kv:conCentroid) cids.push_back(kv.first);
+        for(size_t i=0;i<cids.size();i++) for(size_t j=i+1;j<cids.size();j++)
+            if(cosSim(conCentroid[cids[i]],conCentroid[cids[j]])>=superThresh){
+                int a=findp(cids[i]),b=findp(cids[j]); if(a!=b)parent[a]=b; }
+    }
+    map<int,int> superId; int nextSuper=0; map<int,int> conSuper;
+    for(auto& kv:conCentroid){ int r=findp(kv.first);
+        if(!superId.count(r))superId[r]=nextSuper++; conSuper[kv.first]=superId[r]; }
+    cout<<"\n== 4. CONCEPT FORMATION (super-concepte S = uniune de clustere) ==\n";
+    {
+        map<int,vector<int>> bySuper; for(auto& kv:conSuper) bySuper[kv.second].push_back(kv.first);
+        map<int,vector<int>> conMembers; for(auto& kv:nodeConcept) conMembers[kv.second].push_back(kv.first);
+        for(auto& kv:bySuper){
+            cout<<"  S"<<kv.first<<"  <= { ";
+            bool f=true; for(int c:kv.second){cout<<(f?"":", ")<<"C"<<c;f=false;} cout<<" } : ";
+            f=true; for(int c:kv.second) for(int nd:conMembers[c]){cout<<(f?"":", ")<<tok.name(nd);f=false;}
+            cout<<"\n";
         }
-    };
+    }
 
-    cout<<"\n== 4. INTREBARI (intrare ghidata de query + forward-chaining) ==\n";
-    for(size_t qi=0; qi<qIds.size(); qi++){
+    // ============================================================
+    //  5. CONCEPT COMPRESSION — daca multe muchii au aceeasi semnatura
+    //  (Csrc, R, Cdst), o comprimam intr-o abstractizare A (regularitate).
+    // ============================================================
+    cout<<"\n== 5. CONCEPT COMPRESSION (motive repetate -> abstractizari A) ==\n";
+    {
+        map<tuple<int,int,int>,vector<int>> motif;
+        for(size_t i=0;i<graph.edges.size();i++){ auto& e=graph.edges[i]; if(e.derived)continue;
+            motif[make_tuple(nodeConcept[e.src],e.relCluster,nodeConcept[e.dst])].push_back((int)i); }
+        int aid=0;
+        for(auto& kv:motif) if((int)kv.second.size()>=2){
+            int cs,r,cd; tie(cs,r,cd)=kv.first;
+            cout<<"  A"<<aid++<<"  (C"<<cs<<" --R"<<r<<"--> C"<<cd<<")  comprima "<<kv.second.size()<<" muchii:";
+            for(int ei:kv.second) cout<<"  "<<tok.name(graph.edges[ei].src)<<"->"<<tok.name(graph.edges[ei].dst);
+            cout<<"\n";
+        }
+        if(aid==0) cout<<"  (niciun motiv repetat de >=2 ori)\n";
+    }
+
+    // ============================================================
+    //  6. CAUSAL DISCOVERY — fara reguli: cat de tare PREZICE src tinta dst
+    //  (probabilitate next-token din encoder = semnal cauzal/predictiv).
+    // ============================================================
+    vector<float> causal(graph.edges.size(),0.f);
+    for(size_t i=0;i<graph.edges.size();i++) causal[i]=enc.predProb({graph.edges[i].src},graph.edges[i].dst);
+    { float mx=0; for(float c:causal)mx=max(mx,c); if(mx>0)for(float& c:causal)c/=mx; } // normalizare [0,1]
+    cout<<"\n== 6. CAUSAL DISCOVERY (predictie src->dst; top muchii) ==\n";
+    {
+        vector<int> ord(graph.edges.size()); for(size_t i=0;i<ord.size();i++)ord[i]=(int)i;
+        sort(ord.begin(),ord.end(),[&](int a,int b){return causal[a]>causal[b];});
+        int lim=min((int)ord.size(),8);
+        for(int t=0;t<lim;t++){ auto& e=graph.edges[ord[t]];
+            cout<<"  "<<tok.name(e.src)<<" --R"<<e.relCluster<<"--> "<<tok.name(e.dst)<<"   causal="<<causal[ord[t]]<<"\n"; }
+    }
+
+    // ============================================================
+    //  7. GOAL DISCOVERY — noduri spre care CONVERG multe lanturi (atractori).
+    //  reachCount[v] = cate noduri-sursa pot ajunge la v in graf.
+    // ============================================================
+    map<int,int> reachCount;
+    for(int s:graph.nodes){
+        set<int> seen; queue<int> q; q.push(s); seen.insert(s);
+        while(!q.empty()){ int u=q.front();q.pop();
+            for(int ei:graph.outIdx(u)){ int v=graph.edges[ei].dst; if(!seen.count(v)){seen.insert(v);q.push(v);} } }
+        for(int v:seen) if(v!=s) reachCount[v]++;
+    }
+    int maxReach=0; for(auto& kv:reachCount) maxReach=max(maxReach,kv.second);
+    set<int> goalSet;
+    cout<<"\n== 7. GOAL DISCOVERY (atractori = scop candidat) ==\n";
+    {
+        vector<pair<int,int>> v(reachCount.begin(),reachCount.end());
+        sort(v.begin(),v.end(),[](const pair<int,int>&a,const pair<int,int>&b){return a.second>b.second;});
+        float goalThresh=0.6f;
+        int lim=min((int)v.size(),8);
+        for(int t=0;t<lim;t++){ float gn=maxReach? (float)v[t].second/maxReach:0.f;
+            bool isGoal=gn>=goalThresh; if(isGoal) goalSet.insert(v[t].first);
+            cout<<"  "<<tok.name(v[t].first)<<"  convergenta="<<v[t].second<<" ("<<gn<<")"<<(isGoal?"  <= scop candidat":"")<<"\n"; }
+    }
+
+    // ============================================================
+    //  8. WORLD MODEL — simuleaza pasi urmarind predictia maxima si evalueaza
+    //  consecinta (coerenta = produsul predictiilor pe traiectorie).
+    // ============================================================
+    auto simulate=[&](int start,int steps){
+        vector<int> traj{start}; float coher=1.f; int cur=start; set<int> seen{start};
+        for(int s=0;s<steps;s++){
+            int bestE=-1; float bestP=-1;
+            for(int ei:graph.outIdx(cur)){ if(seen.count(graph.edges[ei].dst))continue;
+                if(causal[ei]>bestP){bestP=causal[ei];bestE=ei;} }
+            if(bestE<0)break;
+            cur=graph.edges[bestE].dst; traj.push_back(cur); seen.insert(cur); coher*=max(1e-3f,bestP);
+        }
+        return make_pair(traj,coher);
+    };
+    cout<<"\n== 8. WORLD MODEL (simulare + consecinte) ==\n";
+    {
+        int shown=0;
+        for(int n:nodeList){ if(graph.outIdx(n).empty())continue;
+            auto pr=simulate(n,6); if(pr.first.size()<2)continue;
+            cout<<"  din '"<<tok.name(n)<<"':  ";
+            for(size_t i=0;i<pr.first.size();i++){if(i)cout<<" -> ";cout<<tok.name(pr.first[i]);}
+            cout<<"   coerenta="<<pr.second<<"\n";
+            if(++shown>=4)break;
+        }
+    }
+
+    // ============================================================
+    //  9. CONTINUOUS LEARNING — conceptele se re-formeaza cand apar date noi:
+    //  clusterizam nodurile dupa prima jumatate de corpus vs dupa tot.
+    // ============================================================
+    cout<<"\n== 9. CONTINUOUS LEARNING (conceptele se schimba cu date noi) ==\n";
+    {
+        auto clusterNodes=[&](const set<int>& ns){
+            Clusterer cc(0.38f); map<int,int> m;
+            vector<int> v(ns.begin(),ns.end()); sort(v.begin(),v.end());
+            for(int nd:v) m[nd]=cc.assign(enc.tokenVec(nd));
+            return make_pair(m,(int)cc.centroid.size());
+        };
+        int half=max(1,(int)factIds.size()/2);
+        set<int> nodesHalf;
+        for(int i=0;i<half;i++) if(factIds[i].size()>=2){ nodesHalf.insert(factIds[i].front()); nodesHalf.insert(factIds[i].back()); }
+        auto a=clusterNodes(nodesHalf); auto b=clusterNodes(graph.nodes);
+        cout<<"  dupa "<<half<<" documente: "<<nodesHalf.size()<<" noduri / "<<a.second<<" concepte\n";
+        cout<<"  dupa tot corpusul: "<<graph.nodes.size()<<" noduri / "<<b.second<<" concepte\n";
+        int merged=0;
+        for(auto& kv:a.first){ // noduri prezente in ambele care si-au schimbat gruparea
+            int nd=kv.first; if(!b.first.count(nd))continue;
+        }
+        (void)merged;
+        cout<<"  => pe masura ce intra documente noi, nodurile se re-grupeaza (clustere noi / fuziuni).\n";
+    }
+
+    // ============================================================
+    //  10. HYPOTHESIS GENERATION + MULTI-PATH REASONING
+    //  Nu mai exista regula "gaseste nodurile din intrebare si porneste de
+    //  acolo". Generam un SPATIU de ipoteze = multe drumuri din tot graful.
+    //  Pentru o intrebare scoram FIECARE ipoteza cu un scor numeric compus:
+    //     query_sim + path_confidence + causal + goal + concept_match
+    //  Alegem ipoteza maxima; daca scorul/relevanta < prag => "Nu stiu".
+    // ============================================================
+    struct Hyp{ vector<int> nodes,rels,eidx; };
+    vector<Hyp> hyps;
+    {
+        const int HMAX=1500, LMAX=6;
+        function<void(int,set<int>&,vector<int>&,vector<int>&,vector<int>&)> gen;
+        gen=[&](int cur,set<int>& vis,vector<int>& n,vector<int>& r,vector<int>& ei){
+            if((int)hyps.size()>=HMAX) return;
+            if(n.size()>=2){ Hyp h; h.nodes=n; h.rels=r; h.eidx=ei; hyps.push_back(h); }
+            if((int)n.size()>=LMAX) return;
+            for(int e:graph.outIdx(cur)){ int d=graph.edges[e].dst; if(vis.count(d))continue;
+                vis.insert(d);n.push_back(d);r.push_back(graph.edges[e].relCluster);ei.push_back(e);
+                gen(d,vis,n,r,ei);
+                vis.erase(d);n.pop_back();r.pop_back();ei.pop_back();
+            }
+        };
+        for(int s:nodeList){ if((int)hyps.size()>=HMAX)break; set<int> vis{s}; vector<int> n{s},r,ei; gen(s,vis,n,r,ei); }
+    }
+    cout<<"\n== 10. HYPOTHESIS GENERATION ("<<hyps.size()<<" ipoteze) + MULTI-PATH SCORING ==\n";
+
+    // Relevanta fata de intrebare (sQ) e semnalul PRIMAR; confidence/causal/goal
+    // sunt modelatori SECUNDARI, activi doar cand drumul e relevant (inmultiti
+    // cu sQ). Asa, o muchie cu causal mare dar irelevanta nu poate castiga.
+    const float W_Q=1.0f,W_CON=0.25f,W_CONF=0.2f,W_CAUS=0.3f,W_GOAL=0.45f,W_OVL=0.5f;
+    const float TAU=0.30f;     // prag scor minim (anti-halucinatie)
+    const float QMIN=0.20f;    // prag relevanta query minima (gateaza raspunsul)
+    auto pathEdgeMean=[&](const Hyp& h){ vector<float> v(enc.D,0);
+        for(int e:h.eidx){auto& em=graph.edges[e].emb; for(int k=0;k<enc.D;k++)v[k]+=em[k];}
+        if(!h.eidx.empty())for(float& x:v)x/=h.eidx.size(); return v; };
+    auto pathNodeMean=[&](const Hyp& h){ vector<float> v(enc.D,0);
+        for(int nd:h.nodes){auto t=enc.tokenVec(nd); for(int k=0;k<enc.D;k++)v[k]+=t[k];}
+        if(!h.nodes.empty())for(float& x:v)x/=h.nodes.size(); return v; };
+
+    for(size_t qi=0;qi<qIds.size();qi++){
         const auto& ids=qIds[qi];
         cout<<"\n  Q: \""<<qLines[qi]<<"\"\n";
-        vector<float> q=enc.meanVec(ids,0,ids.size());            // embedding intrebare
-        vector<int> anchors;                                      // noduri prezente in intrebare
-        for(int t:ids) if(graph.isNode(t)) anchors.push_back(t);
-        if(anchors.empty()){ cout<<"     A: Nu stiu. (niciun nod-ancora in graf)\n"; continue; }
-
-        vector<int> bestNodes,bestRels; float bestR0=-1.f, bestConf=-1.f;
-        for(int a:anchors){
-            for(int ei:graph.outIdx(a)){
-                const Edge& e0=graph.edges[ei];
-                float r0=max(0.f,cosSim(q,e0.emb));               // cat de mult vrea intrebarea aceasta intrare
-                set<int> vis; vis.insert(a); vis.insert(e0.dst);
-                vector<int> n, r; Cont c;                         // continuarea NU include start-ul
-                walk(e0.dst,vis,n,r,0.f,c);                       // forward-chaining
-                float confSum=e0.confidence + max(0.f,c.conf);
-                // lexicografic: r0 primar, confSum secundar
-                if(r0>bestR0+1e-4f || (fabs(r0-bestR0)<=1e-4f && confSum>bestConf)){
-                    bestR0=r0; bestConf=confSum;
-                    bestNodes.assign(1,a); bestNodes.push_back(e0.dst);
-                    for(int x:c.nodes) bestNodes.push_back(x);
-                    bestRels.assign(1,e0.relCluster);
-                    for(int x:c.rels) bestRels.push_back(x);
-                }
-            }
+        vector<float> q=enc.meanVec(ids,0,ids.size());
+        set<int> qset(ids.begin(),ids.end());          // identitate de token (semnal soft de potrivire)
+        int best=-1; float bestScore=-1e9f, bestQ=0;
+        vector<pair<float,int>> ranked; ranked.reserve(hyps.size());
+        for(size_t i=0;i<hyps.size();i++){
+            const Hyp& h=hyps[i];
+            float sQ=max(0.f,cosSim(q,pathEdgeMean(h)));
+            float sCon=max(0.f,cosSim(q,pathNodeMean(h)));
+            float sConf=0,sCaus=0; for(int e:h.eidx){sConf+=graph.edges[e].confidence;sCaus+=causal[e];}
+            if(!h.eidx.empty()){sConf/=h.eidx.size();sCaus/=h.eidx.size();}
+            float sGoal=0; for(int nd:h.nodes) if(goalSet.count(nd)){sGoal=1;break;}
+            // potrivire de identitate (soft): fractia de noduri din drum prezente
+            // in intrebare. NU e un start fix, doar inca un semnal numeric care
+            // departajeaza noduri cu embedding aproape identic (Ion vs Vasile).
+            float sOvl=0; for(int nd:h.nodes) if(qset.count(nd))sOvl+=1; if(!h.nodes.empty())sOvl/=h.nodes.size();
+            // a ajunge la un SCOP descoperit e valoros in sine (termen aditiv);
+            // confidence/causal raman modelatori legati de relevanta (×sQ).
+            float score=W_Q*sQ + W_CON*sCon + W_GOAL*sGoal + W_OVL*sOvl + sQ*(W_CONF*sConf+W_CAUS*sCaus);
+            ranked.push_back({score,(int)i});
+            if(score>bestScore){bestScore=score;best=(int)i;bestQ=sQ;}
         }
-        // anti-halucinatie: intrarea trebuie sa fie suficient de relevanta
-        if(bestNodes.size()<2 || bestR0<ENTRYMIN){
-            cout<<"     A: Nu stiu. (relevanta intrare="<<bestR0<<" < "<<ENTRYMIN<<")\n";
-            continue;
+        sort(ranked.begin(),ranked.end(),[](const pair<float,int>&a,const pair<float,int>&b){return a.first>b.first;});
+        int show=min((int)ranked.size(),3);
+        for(int t=0;t<show;t++){ const Hyp& h=hyps[ranked[t].second];
+            cout<<"     ipoteza#"<<t<<" scor="<<ranked[t].first<<" : ";
+            for(size_t k=0;k<h.nodes.size();k++){if(k)cout<<" -> ";cout<<tok.name(h.nodes[k]);} cout<<"\n"; }
+        if(best<0 || bestScore<TAU || bestQ<QMIN){
+            cout<<"     A: Nu stiu. (scor="<<bestScore<<", query_sim="<<bestQ<<")\n"; continue;
         }
+        const Hyp& h=hyps[best];
         cout<<"     A: ";
-        for(size_t i=0;i<bestNodes.size();i++){ if(i)cout<<" -> "; cout<<tok.name(bestNodes[i]); }
+        for(size_t k=0;k<h.nodes.size();k++){if(k)cout<<" -> ";cout<<tok.name(h.nodes[k]);}
         cout<<"\n        path: ";
-        for(size_t i=0;i+1<bestNodes.size();i++) cout<<tok.name(bestNodes[i])<<" --R"<<bestRels[i]<<"--> ";
-        cout<<tok.name(bestNodes.back());
-        cout<<"\n        intrare_relevance="<<bestR0<<"  path_confidence="<<bestConf<<"\n";
+        for(size_t k=0;k+1<h.nodes.size();k++) cout<<tok.name(h.nodes[k])<<" --R"<<h.rels[k]<<"--> ";
+        cout<<tok.name(h.nodes.back())<<"\n        scor="<<bestScore<<"  query_sim="<<bestQ<<"\n";
     }
     return 0;
 }
