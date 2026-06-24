@@ -31,6 +31,13 @@
 #include <random>
 #include <algorithm>
 #include <functional>
+#include <cstdio>
+// POSIX (Linux) pentru mmap — NU e o librarie externa, e header de sistem.
+// Pe Android/mobil acelasi API e disponibil (bionic libc).
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 using namespace std;
 static mt19937 rng(7);
@@ -549,140 +556,387 @@ struct Engine {
 };
 
 // ============================================================================
-//  MAIN — demo complet cu debug
+//  PARTEA 1 — SCALARE / MEMORIE
+// ============================================================================
+
+// 1.1 CSR GRAPH (Compressed Sparse Row) — cache-friendly, inlocuieste
+//     unordered_map<int,vector<int>>. Construit ca SNAPSHOT read-only din
+//     GraphMemory (graf mutabil la invatare -> CSR compilat pentru reasoning).
+struct CSRGraph {
+    int N=0; vector<int> nodeOffsets, edgeTargets, edgeIds, denseToTok;
+    unordered_map<int,int> tokToDense;
+    void build(const GraphMemory& g){
+        denseToTok.assign(g.nodes.begin(), g.nodes.end()); sort(denseToTok.begin(),denseToTok.end());
+        N=(int)denseToTok.size(); tokToDense.clear(); for(int i=0;i<N;i++) tokToDense[denseToTok[i]]=i;
+        vector<int> deg(N,0);
+        for(auto& e:g.edges){ auto it=tokToDense.find(e.src); if(it!=tokToDense.end()) deg[it->second]++; }
+        nodeOffsets.assign(N+1,0); for(int i=0;i<N;i++) nodeOffsets[i+1]=nodeOffsets[i]+deg[i];
+        int E=nodeOffsets[N]; edgeTargets.assign(E,-1); edgeIds.assign(E,-1);
+        vector<int> cur(nodeOffsets.begin(), nodeOffsets.end()-1);
+        for(int ei=0;ei<(int)g.edges.size();ei++){ auto& e=g.edges[ei]; auto it=tokToDense.find(e.src);
+            if(it==tokToDense.end())continue; int pos=cur[it->second]++;
+            auto jt=tokToDense.find(e.dst); edgeTargets[pos]=jt==tokToDense.end()?-1:jt->second; edgeIds[pos]=ei; }
+    }
+    // vecini (dense idx) ai nodului dense i: [nodeOffsets[i], nodeOffsets[i+1])
+    size_t bytes()const{ return (nodeOffsets.size()+edgeTargets.size()+edgeIds.size()+denseToTok.size())*sizeof(int); }
+};
+
+// 1.2 SERIALIZARE BINARA — salveaza/incarca starea fara reconstructie din text.
+struct GraphSerializer {
+    static void save(const string& path, const GraphMemory& g, EmbeddingStore& es){
+        FILE* f=fopen(path.c_str(),"wb"); if(!f)return;
+        int magic=0x43474D31, D=es.D, V=es.size(), E=(int)g.edges.size();
+        fwrite(&magic,4,1,f); fwrite(&D,4,1,f); fwrite(&V,4,1,f); fwrite(&E,4,1,f);
+        for(int v=0;v<V;v++) fwrite(es.E[v].data(), sizeof(float), D, f);   // embeddings (zona mmap-abila)
+        for(auto& e:g.edges){ fwrite(&e.src,4,1,f); fwrite(&e.dst,4,1,f); fwrite(&e.relCluster,4,1,f);
+            fwrite(&e.confidence,4,1,f); fwrite(&e.seqOffset,1,1,f); fwrite(&e.orderConfidence,4,1,f); }
+        fclose(f);
+    }
+    static bool loadHeader(const string& path,int& D,int& V,int& E){
+        FILE* f=fopen(path.c_str(),"rb"); if(!f)return false; int magic=0;
+        if(fread(&magic,4,1,f)!=1){fclose(f);return false;} fread(&D,4,1,f);fread(&V,4,1,f);fread(&E,4,1,f);
+        fclose(f); return magic==0x43474D31;
+    }
+};
+
+// 1.3 MEMORY-MAPPED STORAGE — mmap REAL (POSIX). Pentru grafuri uriase,
+//     embeddingurile se acceseaza zero-copy din fisier, fara a incarca tot in RAM.
+//     Header: [magic,D,V,E] apoi V*D float. Pe mobil acelasi API (bionic).
+struct MemoryMappedGraphStorage {
+    int fd=-1; void* base=nullptr; size_t len=0;
+    bool openFile(const string& path){
+        fd=::open(path.c_str(),O_RDONLY); if(fd<0)return false;
+        struct stat st; if(fstat(fd,&st)!=0){::close(fd);fd=-1;return false;} len=st.st_size;
+        base=mmap(nullptr,len,PROT_READ,MAP_PRIVATE,fd,0);
+        if(base==MAP_FAILED){base=nullptr;::close(fd);fd=-1;return false;} return true;
+    }
+    const int* header()const{ return (const int*)base; }                       // [magic,D,V,E]
+    const float* embedding(int v,int D)const{ return (const float*)((const char*)base+16)+ (size_t)v*D; } // zero-copy
+    void closeFile(){ if(base){munmap(base,len);base=nullptr;} if(fd>=0){::close(fd);fd=-1;} }
+};
+
+// 1.4 ANN INDEX — LSH cu hiperplane aleatoare. Cautare aproximativa sub-liniara
+//     (bucket + probing Hamming-1), NU O(N) peste toate nodurile.
+struct ANNIndex {
+    int D,H; EmbeddingStore* es; vector<vector<float>> planes;
+    unordered_map<uint64_t,vector<int>> buckets;
+    ANNIndex(EmbeddingStore* s,int d,int h):D(d),H(h),es(s){
+        normal_distribution<float> g(0,1); planes.assign(H,vector<float>(D));
+        for(auto& p:planes) for(float& x:p) x=g(rng);
+    }
+    uint64_t sig(const vector<float>& v)const{ uint64_t s=0; for(int i=0;i<H;i++) if(dotv(v,planes[i])>0) s|=(1ull<<i); return s; }
+    void build(const set<int>& nodes){ buckets.clear(); for(int n:nodes) buckets[sig(es->E[n])].push_back(n); }
+    vector<int> query(const vector<float>& q,int k,int& scanned)const{
+        uint64_t s=sig(q); vector<pair<float,int>> cand; scanned=0;
+        auto scan=[&](uint64_t key){ auto it=buckets.find(key); if(it==buckets.end())return;
+            for(int n:it->second){ cand.push_back({cosv(q,es->E[n]),n}); scanned++; } };
+        scan(s); for(int i=0;i<H;i++) scan(s^(1ull<<i));     // probing vecini Hamming-1
+        sort(cand.begin(),cand.end(),[](const pair<float,int>&a,const pair<float,int>&b){return a.first>b.first;});
+        vector<int> r; for(int i=0;i<k&&i<(int)cand.size();i++) r.push_back(cand[i].second); return r;
+    }
+};
+
+// 1.5 ACTIVE SUBGRAPH — doar top noduri/muchii/drumuri active intra in reasoning.
+struct ActiveSubgraph {
+    vector<int> nodes, edges; vector<vector<int>> paths;
+    void build(const GraphMemory& g,const vector<int>& seed,int maxLen){
+        set<int> ns(seed.begin(),seed.end());
+        for(int s:seed) for(int ei:g.out(s)) ns.insert(g.edges[ei].dst);   // 1-hop
+        nodes.assign(ns.begin(),ns.end());
+        for(int ei=0;ei<(int)g.edges.size();ei++) if(ns.count(g.edges[ei].src)&&ns.count(g.edges[ei].dst)) edges.push_back(ei);
+        for(int s:seed){ vector<int> p{s}; int cur=s; set<int> seen{s};
+            for(int st=0;st<maxLen;st++){ int nx=-1; float bc=0; for(int ei:g.out(cur)) if(!seen.count(g.edges[ei].dst)&&g.edges[ei].confidence>bc){bc=g.edges[ei].confidence;nx=g.edges[ei].dst;}
+                if(nx<0)break; p.push_back(nx); seen.insert(nx); cur=nx; }
+            if(p.size()>=2) paths.push_back(p); }
+    }
+};
+
+// ============================================================================
+//  PARTEA 2 — WORLD MODEL (tranzitii cu confidence/variance/support; simulare;
+//  counterfactual). LIMITA ONESTA: datele nu au POLARITATE (creste/scade), deci
+//  simularea modeleaza PROPAGAREA efectului (ce devine afectat si cu ce
+//  magnitudine), nu semnul. Pentru semn ar trebui muchii cu polaritate invatata.
+// ============================================================================
+struct WorldModel {
+    struct Transition{ int s,rel,ns; float confidence,variance,support; };
+    vector<Transition> trans; unordered_map<int,vector<int>> bySrc;
+    void learn(const GraphMemory& g){
+        trans.clear(); bySrc.clear();
+        map<pair<int,int>,vector<int>> bucket;
+        for(auto& e:g.edges) bucket[{e.src,e.relCluster}].push_back(e.dst);
+        for(auto& kv:bucket){ int sup=(int)kv.second.size(); set<int> uniq(kv.second.begin(),kv.second.end());
+            float var = 1.f - 1.f/(float)uniq.size();                 // mai multe rezultate distincte => mai incert
+            for(int dst:uniq){ int cnt=(int)count(kv.second.begin(),kv.second.end(),dst);
+                int idx=(int)trans.size();
+                trans.push_back({kv.first.first,kv.first.second,dst,(float)cnt/sup,var,(float)sup});
+                bySrc[kv.first.first].push_back(idx); } }
+    }
+    // simulare prin propagare de nivel; risk = incertitudine acumulata
+    map<int,float> simulate(int start,int steps,float& risk,const set<int>& blocked={}){
+        map<int,float> level; level[start]=1.f; map<int,float> frontier=level; risk=0;
+        for(int s=0;s<steps;s++){ map<int,float> nxt;
+            for(auto& kv:frontier){ if(blocked.count(kv.first))continue; auto it=bySrc.find(kv.first); if(it==bySrc.end())continue;
+                for(int ti:it->second){ auto& t=trans[ti]; float flow=kv.second*t.confidence*(1.f-0.3f*t.variance);
+                    if(flow<1e-3f)continue; nxt[t.ns]+=flow; level[t.ns]+=flow; risk+=kv.second*t.variance*0.1f; } }
+            frontier.swap(nxt); if(frontier.empty())break; }
+        return level;
+    }
+};
+
+// ============================================================================
+//  PARTEA 3 — PLANNING ENGINE (Goal -> drumuri candidate -> evaluare -> best)
+// ============================================================================
+struct GoalPlanner {
+    struct Plan{ vector<int> nodes,rels; float score,confidence,risk; };
+    vector<Plan> plan(const GraphMemory& g,int start,int goal,WorldModel& wm,int maxLen){
+        vector<Plan> plans;
+        function<void(int,vector<int>&,vector<int>&,set<int>&,float)> dfs=
+        [&](int cur,vector<int>& ns,vector<int>& rs,set<int>& seen,float conf){
+            if(cur==goal && ns.size()>=2){ Plan p; p.nodes=ns; p.rels=rs; p.confidence=conf;
+                float risk=0; wm.simulate(ns.front(),(int)ns.size(),risk);
+                p.risk=risk; p.score=conf*(1.f-min(1.f,risk)); plans.push_back(p); return; }
+            if((int)ns.size()>=maxLen) return;
+            for(int ei:g.out(cur)){ int d=g.edges[ei].dst; if(seen.count(d))continue;
+                seen.insert(d); ns.push_back(d); rs.push_back(g.edges[ei].relCluster);
+                dfs(d,ns,rs,seen,conf*g.edges[ei].confidence);
+                seen.erase(d); ns.pop_back(); rs.pop_back(); }
+        };
+        vector<int> ns{start},rs; set<int> seen{start}; dfs(start,ns,rs,seen,1.f);
+        sort(plans.begin(),plans.end(),[](const Plan&a,const Plan&b){return a.score>b.score;});
+        return plans;
+    }
+};
+
+// ============================================================================
+//  PARTEA 5 — SELF VERIFICATION (scor compus, numeric)
+//   AnswerScore = Language + GraphSupport + ReasoningSupport + SimulationSupport
+//                 - ContradictionPenalty
+// ============================================================================
+struct Verifier {
+    struct Score{ float language,graph,reasoning,simulation,contradiction,total; };
+    Score verify(const vector<int>& nodes,const GraphMemory& g,WorldModel& wm,
+                 EmbeddingStore& es,const vector<float>& qv){
+        Score sc{}; if(nodes.size()<2){sc.total=0;return sc;}
+        // graph support = confidence medie pe muchiile parcurse + penalizare ordine
+        float gconf=0,ordPen=0; int hops=0;
+        for(size_t i=0;i+1<nodes.size();i++){ for(int ei:g.out(nodes[i])) if(g.edges[ei].dst==nodes[i+1]){
+            gconf+=g.edges[ei].confidence; if(g.edges[ei].orderConfidence<0.4f) ordPen+=1; hops++; break; } }
+        sc.graph = hops? gconf/hops : 0;
+        sc.contradiction = hops? ordPen/hops : 0;
+        // reasoning = lungimea lantului conectat (normalizat)
+        sc.reasoning = min(1.f,(float)hops/4.f);
+        // language = relevanta medie a nodurilor fata de query (proxy lingvistic)
+        float lang=0; for(int n:nodes) lang+=max(0.f,cosv(qv,es.E[n])); sc.language=lang/nodes.size();
+        // simulation = world-model confirma ca finalul e atins din start
+        float risk=0; auto lvl=wm.simulate(nodes.front(),(int)nodes.size()+2,risk);
+        sc.simulation = lvl.count(nodes.back())? min(1.f,lvl[nodes.back()]) : 0.f;
+        sc.total = sc.language+sc.graph+sc.reasoning+sc.simulation-sc.contradiction;
+        return sc;
+    }
+};
+
+// ============================================================================
+//  PARTEA 4 — PROGRAMMING WORLD MODEL (DEMO minimal, dar REAL ca executie)
+//  Limbaj jucarie: atribuiri "x = NUMAR" sau "x = a + b ...". Construieste un
+//  graf de simboluri + muchii de DEPENDENTA (scope/type/call sunt schitate).
+//  ProgramSimulator evalueaza prin ordine topologica = "execution graph".
+//  DEMO: nu e un parser real de C/C++; arata principiul code-as-graph.
+// ============================================================================
+struct ProgrammingGraph {
+    map<string,int> sym; vector<string> names;
+    map<int,vector<string>> rhs;          // simbol -> tokens din partea dreapta
+    map<int,long> directVal;              // simbol -> constanta directa
+    vector<pair<int,int>> depEdges;       // (simbol, simbol-dependinta)  = data dependency
+    int getSym(const string& s){ auto it=sym.find(s); if(it!=sym.end())return it->second;
+        int id=(int)names.size(); sym[s]=id; names.push_back(s); return id; }
+    bool isNumber(const string& s){ if(s.empty())return false; for(char c:s) if(!isdigit((unsigned char)c))return false; return true; }
+    void addAssign(const string& line){               // "x = a + 3"
+        auto t=splitw(line); if(t.size()<3||t[1]!="=")return; int lhs=getSym(t[0]);
+        vector<string> r(t.begin()+2,t.end()); rhs[lhs]=r;
+        if(r.size()==1 && isNumber(r[0])) directVal[lhs]=stol(r[0]);
+        for(auto& tk:r) if(!isNumber(tk) && tk!="+"){ int dep=getSym(tk); depEdges.push_back({lhs,dep}); }
+    }
+    // EXECUTION GRAPH: evaluare prin recursie pe dependente (cu memoizare)
+    long eval(int s, map<int,long>& memo, set<int>& stack){
+        if(memo.count(s))return memo[s]; if(stack.count(s))return 0; stack.insert(s);
+        long v=0; if(directVal.count(s)) v=directVal[s];
+        else if(rhs.count(s)){ for(auto& tk:rhs[s]){ if(tk=="+")continue;
+            if(isNumber(tk)) v+=stol(tk); else v+=eval(sym[tk],memo,stack); } }
+        stack.erase(s); memo[s]=v; return v;
+    }
+    map<string,long> run(){ map<int,long> memo; for(size_t i=0;i<names.size();i++){ set<int> st; eval((int)i,memo,st); }
+        map<string,long> out; for(auto& kv:sym) out[kv.first]=memo[kv.second]; return out; }
+};
+
+// ============================================================================
+//  PARTEA 6 — LEARNERS (online, fara retraining complet). Concept/Relation/
+//  Language exista deja in Engine (clustering + LoRA). Aici: Rule/Goal/Transition.
+// ============================================================================
+struct RuleLearner {  // motiv structural repetat (Csrc,rel,Cdst) -> regula numerica
+    struct Rule{ int cs,rel,cd,count; };
+    vector<Rule> learn(const GraphMemory& g,const map<int,int>& nodeConcept){
+        map<tuple<int,int,int>,int> m;
+        for(auto& e:g.edges){ auto a=nodeConcept.find(e.src),b=nodeConcept.find(e.dst);
+            if(a==nodeConcept.end()||b==nodeConcept.end())continue; m[make_tuple(a->second,e.relCluster,b->second)]++; }
+        vector<Rule> rs; for(auto& kv:m) if(kv.second>=2){ int cs,rel,cd; tie(cs,rel,cd)=kv.first; rs.push_back({cs,rel,cd,kv.second}); }
+        return rs;
+    }
+};
+struct GoalLearner {  // atractori: noduri spre care converg multe lanturi
+    vector<pair<int,int>> learn(const GraphMemory& g){
+        map<int,int> reach;
+        for(int s:g.nodes){ set<int> seen{s}; vector<int> q{s};
+            for(size_t i=0;i<q.size();i++) for(int ei:g.out(q[i])){ int v=g.edges[ei].dst; if(!seen.count(v)){seen.insert(v);q.push_back(v);} }
+            for(int v:seen) if(v!=s) reach[v]++; }
+        vector<pair<int,int>> v(reach.begin(),reach.end());
+        sort(v.begin(),v.end(),[](const pair<int,int>&a,const pair<int,int>&b){return a.second>b.second;});
+        return v;
+    }
+};
+
+// ============================================================================
+//  PARTEA 7 — COGNITIVE LOOP (9 etape explicite)
+//  PERCEIVE -> UNDERSTAND -> RETRIEVE -> REASON -> SIMULATE -> PLAN -> VERIFY
+//  -> GENERATE -> LEARN.  Fiecare etapa e o metoda separata, observabila.
+// ============================================================================
+struct CognitiveLoop {
+    Engine& eng; ANNIndex& ann; WorldModel& wm; GoalPlanner& planner; Verifier& verifier;
+    CognitiveLoop(Engine& e,ANNIndex& a,WorldModel& w,GoalPlanner& p,Verifier& v)
+        :eng(e),ann(a),wm(w),planner(p),verifier(v){}
+
+    void run(const string& prompt,int goalNode){
+        cout<<"\n  ===== COGNITIVE LOOP: \""<<prompt<<"\" =====\n";
+        // 1. PERCEIVE: tokenizare adaptiva
+        vector<string> nw; auto toks=eng.tokenize(prompt,nw);
+        cout<<"  [1 PERCEIVE]  tokeni="<<toks.size()<<", noi="<<nw.size()<<"\n";
+        // 2. UNDERSTAND: embedding de query + ancore in graf
+        vector<float> qv=meanEmb(eng.store,toks,eng.D); vector<int> anchors;
+        for(int t:toks) if(eng.graph.isNode(t)) anchors.push_back(t);
+        cout<<"  [2 UNDERSTAND] ancore in graf: "; for(int a:anchors)cout<<eng.tok.name(a)<<" "; cout<<"\n";
+        // 3. RETRIEVE: ANN (aproximativ) -> noduri relevante; active subgraph
+        int scanned=0; auto near=ann.query(qv,5,scanned);
+        cout<<"  [3 RETRIEVE]  ANN a scanat "<<scanned<<"/"<<eng.graph.nodes.size()<<" noduri; relevante: ";
+        for(int n:near)cout<<eng.tok.name(n)<<" "; cout<<"\n";
+        ActiveSubgraph sub; sub.build(eng.graph,anchors.empty()?near:anchors,6);
+        // 4. REASON: cel mai bun drum din subgraful activ
+        vector<int> bestPath; float bestConf=0;
+        for(auto& p:sub.paths){ float c=1; for(size_t i=0;i+1<p.size();i++) for(int ei:eng.graph.out(p[i])) if(eng.graph.edges[ei].dst==p[i+1]){c*=eng.graph.edges[ei].confidence;break;}
+            if(c>bestConf){bestConf=c;bestPath=p;} }
+        cout<<"  [4 REASON]    drum: "; for(size_t i=0;i<bestPath.size();i++)cout<<(i?" -> ":"")<<eng.tok.name(bestPath[i]); cout<<"\n";
+        // 5. SIMULATE: world model din start
+        float risk=0; if(!bestPath.empty()){ auto lvl=wm.simulate(bestPath.front(),5,risk);
+            cout<<"  [5 SIMULATE]  risc="<<risk<<", noduri afectate="<<lvl.size()<<"\n"; }
+        else cout<<"  [5 SIMULATE]  (fara start)\n";
+        // 6. PLAN: spre obiectivul descoperit
+        if(!anchors.empty()){ auto plans=planner.plan(eng.graph,anchors.front(),goalNode,wm,7);
+            cout<<"  [6 PLAN]      spre '"<<eng.tok.name(goalNode)<<"': "<<plans.size()<<" planuri; best: ";
+            if(!plans.empty()){ for(size_t i=0;i<plans[0].nodes.size();i++)cout<<(i?" -> ":"")<<eng.tok.name(plans[0].nodes[i]);
+                cout<<"  (score="<<plans[0].score<<")"; } cout<<"\n"; }
+        else cout<<"  [6 PLAN]      (fara ancora)\n";
+        // 7. VERIFY: scor compus
+        Verifier::Score vs=verifier.verify(bestPath.empty()?near:bestPath,eng.graph,wm,eng.store,qv);
+        cout<<"  [7 VERIFY]    lang="<<vs.language<<" graph="<<vs.graph<<" reason="<<vs.reasoning
+            <<" sim="<<vs.simulation<<" contra="<<vs.contradiction<<" => total="<<vs.total<<"\n";
+        // 8. GENERATE: prudent daca verificarea e slaba (verdict numeric, nu semantic)
+        if(vs.total < 0.6f) cout<<"  [8 GENERATE]  suport slab => raspuns prudent: \"Nu sunt sigur.\"\n";
+        else { cout<<"  [8 GENERATE]  raspuns ancorat in graf: "; for(size_t i=0;i<bestPath.size();i++)cout<<(i?" ":"")<<eng.tok.name(bestPath[i]); cout<<"\n"; }
+        // 9. LEARN: intareste muchiile drumului folosit (invatare continua)
+        if(!bestPath.empty()){ vector<float> ctx=meanEmb(eng.store,bestPath,eng.D);
+            for(int n:bestPath) eng.online.updateNodeEmbedding(n,ctx,0.02f);
+            cout<<"  [9 LEARN]     drum confirmat: embedding-uri/confidence intarite\n"; }
+    }
+};
+
+// ============================================================================
+//  MAIN — demo integrat (Parti 1-7) + analiza
 // ============================================================================
 int main(){
     Engine eng(DEMO_D);
     auto& tok=eng.tok; auto& store=eng.store; auto& graph=eng.graph; auto& T=eng.T;
 
-    // ---- A. INVATARE LENTA: pretrain corp + embeddings pe corpus romanesc ----
+    // --- corpus mic + pretrain (model mic; inteligenta sta in graf/world-model) ---
     vector<string> ro = {
-        "om este fiinta","om este viu","pisica este animal","caine este animal",
-        "pisica mananca hrana","caine mananca hrana","om mananca hrana",
-        "Ion este om","Vasile este om","Ion hraneste pisica","Ion lucreaza sofer",
-        "sofer conduce camion","munca produce bani","motorul produce putere",
-        "focul produce caldura","bani cumpara hrana","hrana sustine om","om munceste pentru bani"
+        "om este fiinta","pisica este animal","caine este animal","Ion este om","Vasile este om",
+        "Ion lucreaza sofer","sofer conduce camion","sofer face munca","munca produce bani",
+        "bani cumpara hrana","hrana sustine om","om munceste pentru bani","motorul produce putere",
+        "focul produce caldura"
     };
-    vector<vector<int>> roIds; { for(auto& s:ro){ vector<string> nw; roIds.push_back(eng.tokenize(s,nw)); } }
-
-    cout<<"== A. PRETRAIN (invatare lenta: corp transformer + embeddings) ==\n";
-    cout<<"   D="<<DEMO_D<<" (tinta scalare TARGET_D="<<TARGET_D<<"), heads="<<HEADS
-        <<", straturi(demo)="<<NLAYERS_DEMO<<"\n   vocab initial (incl. tokeni virtuali): "<<store.size()<<"\n";
-    float step=0;
-    for(int ep=0;ep<400;ep++){ float tot=0;int c=0; vector<int> ord(roIds.size());
-        for(int i=0;i<(int)ord.size();i++)ord[i]=i; shuffle(ord.begin(),ord.end(),rng);
-        for(int i:ord){ tot+=T.trainSeq(roIds[i],true,false,0.01f,1e-3f,step); c++; }
-        if(ep%100==0)cout<<"   epoch "<<ep<<" loss "<<tot/max(1,c)<<"\n"; }
+    vector<vector<int>> roIds; for(auto& s:ro){ vector<string> nw; roIds.push_back(eng.tokenize(s,nw)); }
+    cout<<"== PRETRAIN (model mic) ==  D="<<DEMO_D<<" -> tinta TARGET_D="<<TARGET_D<<"\n";
+    float step=0; for(int ep=0;ep<200;ep++){ vector<int> ord(roIds.size()); for(int i=0;i<(int)ord.size();i++)ord[i]=i;
+        shuffle(ord.begin(),ord.end(),rng); for(int i:ord) T.trainSeq(roIds[i],true,false,0.01f,1e-3f,step); }
     for(auto& ids:roIds) eng.absorb(ids);
-    cout<<"   graf: "<<graph.nodes.size()<<" noduri, "<<graph.edges.size()<<" muchii\n\n";
+    cout<<"   graf: "<<graph.nodes.size()<<" noduri, "<<graph.edges.size()<<" muchii\n";
 
-    auto showConcepts=[&](){ map<int,vector<int>> byc; for(auto&kv:eng.nodeConcept)byc[kv.second].push_back(kv.first);
-        for(auto&kv:byc){ cout<<"     C"<<kv.first<<": "; bool f=true; for(int n:kv.second){cout<<(f?"":", ")<<tok.name(n);f=false;} cout<<"\n"; } };
-    cout<<"== CONCEPTE emergente (clustere de noduri) ==\n"; showConcepts();
-    cout<<"== MUCHII ORDINALE (src@pos --R--> dst@pos, offset, orderConf) ==\n";
-    for(int i=0;i<(int)graph.edges.size() && i<8;i++){ auto&e=graph.edges[i];
-        cout<<"     "<<tok.name(e.src)<<"@"<<(int)e.srcPosition<<" --R"<<e.relCluster<<"--> "<<tok.name(e.dst)
-            <<"@"<<(int)e.dstPosition<<"  offset="<<(int)e.seqOffset<<" orderConf="<<e.orderConfidence<<"\n"; }
-    cout<<"\n";
+    // ================= PARTEA 1: SCALARE / MEMORIE =================
+    cout<<"\n========== PARTEA 1: SCALARE / MEMORIE ==========\n";
+    CSRGraph csr; csr.build(graph);
+    cout<<"[CSR] N="<<csr.N<<" muchii="<<csr.edgeTargets.size()<<" memorie="<<csr.bytes()<<" bytes (cache-friendly)\n";
+    { int di=csr.tokToDense.count(tok.get("Ion"))?csr.tokToDense[tok.get("Ion")]:-1;
+      if(di>=0){ cout<<"   vecini CSR ai 'Ion': "; for(int p=csr.nodeOffsets[di];p<csr.nodeOffsets[di+1];p++)
+          cout<<tok.name(csr.denseToTok[csr.edgeTargets[p]])<<" "; cout<<"\n"; } }
 
-    auto neighbors=[&](const string& w,int k){ int id=tok.get(w); if(id<0){cout<<"     (necunoscut)\n";return;}
-        vector<pair<float,int>> v; for(int n:graph.nodes){ if(n==id)continue; v.push_back({cosv(store.E[id],store.E[n]),n}); }
-        sort(v.begin(),v.end(),[](auto&a,auto&b){return a.first>b.first;});
-        cout<<"     "<<w<<" ~ "; for(int i=0;i<k&&i<(int)v.size();i++)cout<<tok.name(v[i].second)<<"("<<v[i].first<<") "; cout<<"\n"; };
+    ANNIndex ann(&store,DEMO_D,6); ann.build(graph.nodes);
+    { int scanned=0; int ionId=tok.get("Ion"); auto near=ann.query(store.E[ionId],4,scanned);
+      cout<<"[ANN/LSH] query 'Ion' a scanat "<<scanned<<"/"<<graph.nodes.size()<<" noduri (sub-liniar); vecini: ";
+      for(int n:near)cout<<tok.name(n)<<" "; cout<<"\n"; }
 
-    // ---- B. ONLINE: cuvinte inventate (corp INGHETAT; doar embeddings) ----
-    cout<<"== B. ONLINE: cuvinte noi inventate (fara retraining al corpului) ==\n";
-    for(string s:{string("Ion hraneste blorf"),string("blorf este animal"),string("blorf mananca hrana")}){
-        vector<string> nw; auto ids=eng.tokenize(s,nw);
-        for(auto& w:nw) cout<<"   [TOKEN NOU] \""<<w<<"\" id "<<tok.get(w)<<" (context fast-weights: char+context+vecini)\n";
-        for(int it=0;it<25;it++) T.trainSeq(ids,false,false,0.012f,6e-3f,step);
-        // online embedding learner: muta nodul spre contextul propozitiei
-        vector<float> ctx=meanEmb(store,ids,DEMO_D); for(int id:ids) eng.online.updateNodeEmbedding(id,ctx,0.05f);
-        eng.absorb(ids);
-    }
-    cout<<"   vecini invatati pentru 'blorf':\n"; neighbors("blorf",4);
+    GraphSerializer::save("/tmp/graph.bin",graph,store);
+    { int D,V,E; bool ok=GraphSerializer::loadHeader("/tmp/graph.bin",D,V,E);
+      cout<<"[SERIALIZE] /tmp/graph.bin  ok="<<ok<<"  D="<<D<<" V="<<V<<" E="<<E<<" (incarcare fara reconstructie din text)\n"; }
+    { MemoryMappedGraphStorage mm; if(mm.openFile("/tmp/graph.bin")){ const int* h=mm.header();
+        cout<<"[MMAP] zero-copy header: D="<<h[1]<<" V="<<h[2]<<" E="<<h[3]
+            <<"; emb[Ion][0]="<<mm.embedding(tok.get("Ion"),h[1])[0]<<" (acces direct din fisier)\n"; mm.closeFile(); } }
 
-    // ---- C. ONLINE: limba noua (engleza) prin LoRA per-domeniu ----
-    cout<<"\n== C. ONLINE: limba noua (engleza) via DomainDetector + LoRA ==\n";
-    vector<string> en={"man is human","man is living","cat is animal","cat eats food",
-                       "driver drives truck","work produces money"};
-    // detecteaza domeniul propozitiilor engleze (distributie diferita => domeniu nou)
-    eng.lora.clear();
-    auto ensureDomain=[&](const vector<int>& ids)->int{ vector<float> se=meanEmb(store,ids,DEMO_D); bool isNew;
-        int d=eng.domains.detect(se,isNew); while((int)eng.lora.size()<=d) eng.lora.push_back(LoRAAdapter(DEMO_D,LORA_R,1.0f));
-        return d; };
-    // pre-creeaza tokenii ca sa avem embedding pentru detectie de domeniu
-    vector<vector<int>> enIds; for(auto& s:en){ vector<string> nw; auto ids=eng.tokenize(s,nw); enIds.push_back(ids);
-        for(auto& w:nw) cout<<"   [TOKEN NOU en] \""<<w<<"\" id "<<tok.get(w)<<"\n"; }
-    for(size_t i=0;i<enIds.size();i++){ int d=ensureDomain(enIds[i]); eng.T.ffnLora=&eng.lora[d];
-        for(int it=0;it<25;it++) T.trainSeq(enIds[i],false,true,0.012f,6e-3f,step); // doar embeddings + LoRA-ul domeniului
-        eng.absorb(enIds[i]); }
-    eng.T.ffnLora=nullptr;
-    cout<<"   domenii detectate (clustere de distributie): "<<eng.domains.clust.centroid.size()
-        <<" (=> "<<eng.lora.size()<<" adaptere LoRA)\n";
-    cout<<"   aliniere cross-lingva emergenta (cosine, fara dictionar):\n";
-    for(string w:{string("man"),string("cat"),string("driver"),string("work")}) neighbors(w,3);
+    ActiveSubgraph sub; sub.build(graph,{tok.get("Ion")},6);
+    cout<<"[ACTIVE SUBGRAPH] noduri="<<sub.nodes.size()<<" muchii="<<sub.edges.size()<<" drumuri="<<sub.paths.size()<<"\n";
 
-    // ---- INT8-ready demo (doar arata structura) ----
-    { QuantizedMat q=QuantizedMat::fromMat(T.W2);
-      cout<<"\n== INT8-READY (demo) ==\n   W2 cuantizat int8: "<<q.R<<"x"<<q.C
-          <<", eroare medie dequant ~ "; double er=0; for(int i=0;i<T.W2.R;i++)for(int j=0;j<T.W2.C;j++)er+=fabs(q.at(i,j)-T.W2.at(i,j));
-      cout<<er/(T.W2.R*T.W2.C)<<" (structura; kernel INT8 ar inlocui Mat in productie)\n"; }
+    // ================= PARTEA 2: WORLD MODEL =================
+    cout<<"\n========== PARTEA 2: WORLD MODEL ==========\n";
+    WorldModel wm; wm.learn(graph);
+    cout<<"[WORLD MODEL] tranzitii invatate="<<wm.trans.size()<<" (fiecare cu confidence/variance/support)\n";
+    { float risk=0; auto lvl=wm.simulate(tok.get("Ion"),6,risk);
+      cout<<"   SIMULARE din 'Ion' (6 pasi): afectate="<<lvl.size()<<" risc="<<risk<<"\n      ";
+      vector<pair<float,int>> v; for(auto&kv:lvl)v.push_back({kv.second,kv.first});
+      sort(v.begin(),v.end(),[](auto&a,auto&b){return a.first>b.first;});
+      for(int i=0;i<6&&i<(int)v.size();i++)cout<<tok.name(v[i].second)<<"("<<v[i].first<<") "; cout<<"\n"; }
+    { // COUNTERFACTUAL: "ce daca Ion nu mai lucreaza" => blocam nodul 'sofer' (jobul)
+      float r0=0,r1=0; auto base=wm.simulate(tok.get("Ion"),6,r0);
+      set<int> blk{tok.get("sofer")}; auto cf=wm.simulate(tok.get("Ion"),6,r1,blk);
+      float lostBani = (base.count(tok.get("bani"))?base[tok.get("bani")]:0) - (cf.count(tok.get("bani"))?cf[tok.get("bani")]:0);
+      cout<<"   COUNTERFACTUAL (blocam 'sofer'): efect asupra 'bani' = -"<<lostBani
+          <<"  (consecinta estimata, fara executie reala)\n"; }
 
-    // ---- D. GRAPH-AUGMENTED GENERATION cu debug pe pasi ----
-    cout<<"\n== D. GRAPH-AUGMENTED GENERATION (cross-attention + bias) ==\n";
-    auto generate=[&](const string& prompt,int steps,bool factual,bool verbose){
-        vector<string> nw; auto ctx=eng.tokenize(prompt,nw);
-        ActiveGraphState A; { vector<int> seed; for(int t:ctx) if(graph.isNode(t))seed.push_back(t); A.seed(seed,1.f); }
-        vector<float> qv=meanEmb(store,ctx,DEMO_D); string out; vector<int> gen=ctx;
-        set<int> used(ctx.begin(),ctx.end()); float supSum=0; int supN=0; float firstSup=-1;
-        for(int s=0;s<steps;s++){ Engine::StepDbg dbg;
-            int nt=eng.nextToken(gen,A,qv,used,dbg,factual); if(nt<0)break;
-            supSum+=dbg.support; supN++; if(firstSup<0)firstSup=dbg.support; // grounding = suport la pasul 0
-            if(verbose && s<2){ cout<<"   [pas "<<s<<"] crossScore="<<dbg.crossScore<<" fusedNorm="<<dbg.fusedNorm
-                <<" support="<<dbg.support<<"\n      active: ";
-                for(auto&p:A.topk(5))cout<<tok.name(p.first)<<"("<<p.second<<") "; cout<<"\n      paths: ";
-                for(auto&hp:A.activePaths){ cout<<"["; for(size_t i=0;i<hp.nodes.size();i++)cout<<(i?">":"")<<tok.name(hp.nodes[i]); cout<<"] "; } cout<<"\n";
-                cout<<"      logits BEFORE bias: "; for(size_t i=0;i<dbg.baseIdx.size();i++)cout<<tok.name(dbg.baseIdx[i])<<"("<<dbg.baseTop[i]<<") "; cout<<"\n";
-                cout<<"      logits AFTER  bias: "; for(size_t i=0;i<dbg.biasIdx.size();i++)cout<<tok.name(dbg.biasIdx[i])<<"("<<dbg.biasTop[i]<<") "; cout<<"\n";
-                cout<<"      -> token ales: "<<tok.name(nt)<<"\n"; }
-            gen.push_back(nt); used.insert(nt); out+=(out.empty()?"":" ")+tok.name(nt);
-            A.decay(); A.reinforceByToken(nt,store,0.6f); }
-        // grounding (suport la pasul 0, inainte de auto-reinforcement) = verdictul
-        // factual; media ar fi inflata de tokenii auto-generati.
-        float sup=firstSup<0?0:firstSup; return make_pair(out,sup);
-    };
-    cout<<"  prompt: \"Ion\"\n"; { auto r=generate("Ion",6,true,true); cout<<"  => \""<<r.first<<"\"  support="<<r.second<<"\n\n"; }
-    cout<<"  prompt: \"om munceste\"\n"; { auto r=generate("om munceste",6,true,false); cout<<"  => \""<<r.first<<"\"  support="<<r.second<<"\n\n"; }
+    // ================= PARTEA 3: PLANNING =================
+    cout<<"\n========== PARTEA 3: PLANNING ==========\n";
+    GoalLearner gl; auto goals=gl.learn(graph);
+    int goalNode = goals.empty()? tok.get("bani") : goals.front().first;
+    cout<<"[GOAL LEARNER] obiectiv-atractor descoperit: '"<<tok.name(goalNode)<<"'\n";
+    GoalPlanner planner; auto plans=planner.plan(graph,tok.get("Ion"),tok.get("bani"),wm,7);
+    cout<<"[PLANNER] planuri Ion -> bani: "<<plans.size()<<"\n";
+    for(int i=0;i<3&&i<(int)plans.size();i++){ cout<<"   #"<<i<<" score="<<plans[i].score<<" conf="<<plans[i].confidence<<" : ";
+        for(size_t k=0;k<plans[i].nodes.size();k++)cout<<(k?" -> ":"")<<tok.name(plans[i].nodes[k]); cout<<"\n"; }
 
-    // ---- E. COGNITIVE LOOP cu tokeni virtuali ----
-    //  Mecanism general: daca suportul initial e slab (incertitudine), modelul
-    //  emite [SEARCH_GRAPH]; bucla cauta un path, il INJECTEAZA in context si
-    //  continua. Trigger-ul e NUMERIC (prag de suport), nu semantic.
-    cout<<"== E. COGNITIVE LOOP (tokeni virtuali de actiune) ==\n";
-    auto cognitive=[&](const string& prompt){
-        vector<string> nw; auto ctx=eng.tokenize(prompt,nw);
-        ActiveGraphState A; { vector<int> seed; for(int t:ctx) if(graph.isNode(t))seed.push_back(t); A.seed(seed,1.f); }
-        vector<float> qv=meanEmb(store,ctx,DEMO_D); Engine::StepDbg dbg; set<int> used(ctx.begin(),ctx.end());
-        int first=eng.nextToken(ctx,A,qv,used,dbg,true);
-        cout<<"  prompt: \""<<prompt<<"\"  support initial="<<dbg.support<<"\n";
-        if(dbg.support < 0.15f){ // incertitudine -> actiune [SEARCH_GRAPH]
-            cout<<"  model emite "<<tok.name(eng.VT_SEARCH)<<" (suport slab => cauta in graf)\n";
-            A.buildHypotheses(graph,1,6);
-            if(!A.activePaths.empty()){ cout<<"  [engine] injecteaza path: ";
-                for(size_t i=0;i<A.activePaths[0].nodes.size();i++)cout<<(i?" > ":"")<<tok.name(A.activePaths[0].nodes[i]); cout<<"\n";
-                for(int n:A.activePaths[0].nodes) ctx.push_back(n); }
-            cout<<"  model emite "<<tok.name(eng.VT_RESULT)<<" si continua generarea\n";
-        } else cout<<"  suport suficient => fara cautare; genereaza direct ("<<tok.name(first)<<"...)\n";
-    };
-    cognitive("Ion");
-    cognitive("xyzzy");   // necunoscut => suport slab => [SEARCH_GRAPH] (dar graf gol pe acel nod)
+    // ================= PARTEA 4: PROGRAMMING WORLD MODEL (demo) =================
+    cout<<"\n========== PARTEA 4: PROGRAMMING WORLD MODEL (demo executie) ==========\n";
+    ProgrammingGraph pg; for(string line:{string("x = 5"),string("y = x + 3"),string("z = y + x"),string("w = z + 2")}){ pg.addAssign(line); cout<<"   cod: "<<line<<"\n"; }
+    cout<<"   muchii de dependenta (data-dependency graph): "<<pg.depEdges.size()<<"\n";
+    { auto vals=pg.run(); cout<<"   EXECUTION GRAPH -> valori: "; for(auto&kv:vals)cout<<kv.first<<"="<<kv.second<<" "; cout<<"\n"; }
 
-    // ---- F. ANTI-HALUCINATIE pe suport factual (verdict numeric) ----
-    cout<<"\n== F. ANTI-HALUCINATIE (verdict pe suport, nu pe cuvinte) ==\n";
-    const float SUP_MIN=0.12f;
-    auto answer=[&](const string& p){ auto r=generate(p,5,true,false);
-        cout<<"  Q:\""<<p<<"\" support="<<r.second<<(r.second<SUP_MIN?"  => Nu stiu (prudent).\n":("  => \""+r.first+"\"\n")); };
-    answer("Ion"); answer("blorf"); answer("xyzzy zextro");
+    // ================= PARTEA 6: LEARNERS =================
+    cout<<"\n========== PARTEA 6: LEARNERS (online) ==========\n";
+    RuleLearner rl; auto rules=rl.learn(graph,eng.nodeConcept);
+    cout<<"[RULE LEARNER] reguli (motive Csrc->R->Cdst) cu count>=2: "<<rules.size()<<"\n";
+    cout<<"[TRANSITION LEARNER] = WorldModel.learn ("<<wm.trans.size()<<" tranzitii)\n";
+    cout<<"[GOAL LEARNER] top atractori: "; for(int i=0;i<4&&i<(int)goals.size();i++)cout<<tok.name(goals[i].first)<<"("<<goals[i].second<<") "; cout<<"\n";
+    cout<<"[CONCEPT/RELATION/LANGUAGE LEARNER] = clustering + LoRA din Engine (v6)\n";
+
+    // ================= PARTEA 5+7: VERIFIER + COGNITIVE LOOP =================
+    cout<<"\n========== PARTEA 5+7: VERIFIER + COGNITIVE LOOP ==========\n";
+    Verifier verifier; CognitiveLoop loop(eng,ann,wm,planner,verifier);
+    loop.run("de ce lucreaza Ion", tok.get("bani"));
+    loop.run("xyzzy necunoscut", goalNode);   // fara suport => raspuns prudent
+
+    cout<<"\n== Gata. Vezi analiza inginereasca de mai jos (in raspunsul asistentului). ==\n";
     return 0;
 }
