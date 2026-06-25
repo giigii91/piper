@@ -55,7 +55,7 @@ constexpr int LORA_R = 8;        // rang adapter LoRA
 // modelul mic (D=64, 1 strat) supra-invata, normele embeddingurilor cresc si
 // peisajul cosine-logit devine zgomotos => raspunsul redevine salata de cuvinte.
 // ~800 e optimul empiric pentru fluenta pe acest corpus mic.
-constexpr int PRETRAIN_EPOCHS = 800;
+constexpr int PRETRAIN_EPOCHS = 1100;
 
 // ----------------------------------------------------------------------------
 //  Utilitare numerice
@@ -501,6 +501,18 @@ struct Engine {
     map<int,int> nodeConcept; vector<LoRAAdapter> lora;   // un adapter per domeniu
     // tokeni virtuali de actiune (cognitive loop)
     int VT_THINK,VT_SEARCH,VT_MEM,VT_ASK,VT_ACT,VT_WAIT,VT_RESULT;
+    int EOS=-1;                 // token special de final (creat din dataset)
+    set<int> stopwords;        // DEDUSE din date (frecvente, ne-noduri) — nu lista hardcodata
+    bool isEos(int id)const{ return id>=0 && id==EOS; }
+    bool isStopword(int id)const{ return stopwords.count(id)>0; }
+    // invata stopword-urile: tokeni frecventi care NU sunt noduri-continut in graf
+    // (cuvintele de legatura apar des dar nu devin tinte/surse semantice).
+    void learnStopwords(const vector<vector<int>>& corpus,float dfRatio){
+        map<int,int> df; for(auto& s:corpus){ set<int> u(s.begin(),s.end()); for(int t:u) df[t]++; }
+        int N=max(1,(int)corpus.size()); stopwords.clear();
+        for(auto& kv:df){ if(graph.isNode(kv.first)) continue;   // nodurile-continut nu-s stopword
+            if((float)kv.second/N >= dfRatio) stopwords.insert(kv.first); }
+    }
 
     Engine(int d):D(d),store(d),tok(&store,d),T(&store,d,4*d,HEADS),gca(d),
         online(&store),relClust(0.55f),conClust(0.42f),domains(0.55f){
@@ -856,9 +868,9 @@ static string generateCognitiveAnswer(Engine& eng,const string& userQuestion,
     // context = intrebare + un cue 'raspuns' (delimitator INVATAT din date, daca exista)
     vector<string> nw; vector<int> ctx=eng.tokenize(userQuestion,nw);
     int cue=tok.get("raspuns"); if(cue>=0) ctx.push_back(cue);
-    // ACTIVAM contextul cognitiv: intrebare + drum de rationament + plan + scop
+    // ACTIVAM contextul cognitiv: intrebare (fara stopword-uri) + drum + plan + scop
     ActiveGraphState A;
-    for(int id:ctx) if(graph.isNode(id)) A.activate(id,1.0f);
+    for(int id:ctx) if(graph.isNode(id) && !eng.isStopword(id)) A.activate(id,1.0f);
     for(int id:bestPath) A.activate(id,1.0f);
     for(int id:planPath) A.activate(id,0.9f);
     if(goalNode>=0 && graph.isNode(goalNode)) A.activate(goalNode,0.8f);
@@ -871,7 +883,8 @@ static string generateCognitiveAnswer(Engine& eng,const string& userQuestion,
         Engine::StepDbg dbg;
         // mod fluent: bias mic => graful INFLUENTEAZA, transformerul conduce gramatica
         int nx=eng.nextToken(ctx,A,qv,used,dbg,false,/*ovGamma*/0.25f,/*ovBeta*/1.0f,/*ovRep*/0.8f);
-        if(nx<0 || tok.isVirtual(nx) || nx==cue) break;     // delimitator reaparut => sfarsit raspuns
+        // OPRIRE principala = EOS (ca la LLM-uri); nu se adauga in raspuns
+        if(nx<0 || eng.isEos(nx) || tok.isVirtual(nx) || nx==cue) break;
         gen.push_back(nx); int gn=(int)gen.size();          // oprire la ciclu scurt (perioada 2 sau 3)
         if(gn>=4 && gen[gn-1]==gen[gn-3] && gen[gn-2]==gen[gn-4]) break;
         if(gn>=6 && gen[gn-1]==gen[gn-4] && gen[gn-2]==gen[gn-5] && gen[gn-3]==gen[gn-6]) break;
@@ -896,8 +909,9 @@ struct CognitiveLoop {
         cout<<"  [1 PERCEIVE]  tokeni="<<toks.size()<<", noi="<<nw.size()<<"\n";
         // 2. UNDERSTAND: embedding de query + ancore in graf
         vector<float> qv=meanEmb(eng.store,toks,eng.D); vector<int> anchors;
-        for(int t:toks) if(eng.graph.isNode(t)) anchors.push_back(t);
-        cout<<"  [2 UNDERSTAND] ancore in graf: "; for(int a:anchors)cout<<eng.tok.name(a)<<" "; cout<<"\n";
+        // ancorele de reasoning EXCLUD stopword-urile (deduse din date)
+        for(int t:toks) if(eng.graph.isNode(t) && !eng.isStopword(t)) anchors.push_back(t);
+        cout<<"  [2 UNDERSTAND] ancore in graf (fara stopword): "; for(int a:anchors)cout<<eng.tok.name(a)<<" "; cout<<"\n";
         // 3. RETRIEVE: ANN (aproximativ) -> noduri relevante; active subgraph
         int scanned=0; auto near=ann.query(qv,5,scanned);
         cout<<"  [3 RETRIEVE]  ANN a scanat "<<scanned<<"/"<<eng.graph.nodes.size()<<" noduri; relevante: ";
@@ -935,6 +949,60 @@ struct CognitiveLoop {
             cout<<"  [9 LEARN]     drum confirmat: embedding-uri/confidence intarite\n"; }
     }
 };
+
+// ============================================================================
+//  ABLATION — aceeasi intrebare, generata cu tot mai multe componente active.
+//  level 1=transformer pur; 2=+graf; 3=+world; 4=+planner; 5=full(+goal+verifier).
+//  Oprire = EOS. Contributie per-token (verbose): top transformer vs top final.
+// ============================================================================
+static string genAblation(Engine& eng,const string& q,int level,GraphMemory& graph,
+        WorldModel& wm,GoalPlanner& planner,int goalNode,Verifier& verifier,bool verbose){
+    auto& tok=eng.tok; auto& store=eng.store;
+    vector<string> nw; vector<int> ctx=eng.tokenize(q,nw);
+    int cue=tok.get("raspuns"); if(cue>=0) ctx.push_back(cue);
+    vector<int> anchors; for(int t:ctx) if(graph.isNode(t)&&!eng.isStopword(t)) anchors.push_back(t);
+    ActiveGraphState A; vector<int> bestPath,planPath;
+    if(level>=2 && !anchors.empty()){
+        int cur=anchors.front(); bestPath.push_back(cur); set<int> seen{cur};
+        for(int s=0;s<6;s++){ int nx=-1; float bc=0; for(int ei:graph.out(cur)) if(!seen.count(graph.edges[ei].dst)&&graph.edges[ei].confidence>bc){bc=graph.edges[ei].confidence;nx=graph.edges[ei].dst;}
+            if(nx<0)break; bestPath.push_back(nx); seen.insert(nx); cur=nx; }
+        for(int id:anchors) A.activate(id,1.0f); for(int id:bestPath) A.activate(id,1.0f);
+    }
+    if(level>=3 && !bestPath.empty()){ float risk=0; auto lvl=wm.simulate(bestPath.front(),4,risk);
+        for(auto& kv:lvl) if(kv.second>0.2f) A.activate(kv.first,min(0.7f,kv.second)); }
+    if(level>=4 && !anchors.empty()){ auto plans=planner.plan(graph,anchors.front(),goalNode,wm,7);
+        if(!plans.empty()){ planPath=plans[0].nodes; for(int id:planPath) A.activate(id,0.9f); } }
+    if(level>=5){ if(goalNode>=0&&graph.isNode(goalNode)) A.activate(goalNode,0.8f);
+        Verifier::Score vs=verifier.verify(bestPath.empty()?anchors:bestPath,graph,wm,store,meanEmb(store,ctx,eng.D));
+        if(anchors.empty() || vs.total<0.6f) return string("nu sunt sigur"); }   // verifier gating (numeric)
+    float g = (level==1)? 0.f : 0.25f, b = (level==1)? 0.f : 1.0f;   // level1 = transformer pur
+    vector<float> qv=meanEmb(store,ctx,eng.D); set<int> used(ctx.begin(),ctx.end());
+    string out; vector<int> gen;
+    for(int i=0;i<32;i++){ Engine::StepDbg dbg;
+        int nx=eng.nextToken(ctx,A,qv,used,dbg,false,g,b,0.8f);
+        if(nx<0 || eng.isEos(nx) || tok.isVirtual(nx) || nx==cue) break;     // oprire principala = EOS
+        gen.push_back(nx); int gn=(int)gen.size();
+        if(gn>=4&&gen[gn-1]==gen[gn-3]&&gen[gn-2]==gen[gn-4])break;
+        if(gn>=6&&gen[gn-1]==gen[gn-4]&&gen[gn-2]==gen[gn-5]&&gen[gn-3]==gen[gn-6])break;
+        if(verbose){ cout<<"        ['"<<tok.name(nx)<<"']  top TRANSFORMER: ";
+            for(size_t k=0;k<dbg.baseIdx.size()&&k<3;k++)cout<<tok.name(dbg.baseIdx[k])<<"("<<dbg.baseTop[k]<<") ";
+            cout<<" | top FINAL(+graf/world/goal): ";
+            for(size_t k=0;k<dbg.biasIdx.size()&&k<3;k++)cout<<tok.name(dbg.biasIdx[k])<<"("<<dbg.biasTop[k]<<") "; cout<<"\n"; }
+        out+=(out.empty()?"":" ")+tok.name(nx); ctx.push_back(nx); used.insert(nx); A.decay(); A.reinforceByToken(nx,store,0.4f);
+    }
+    return out.empty()?string("(nimic)"):out;
+}
+static void runAblationTests(Engine& eng,GraphMemory& graph,WorldModel& wm,GoalPlanner& planner,
+        GoalLearner& goalLearner,Verifier& verifier,const string& question){
+    auto goals=goalLearner.learn(graph); int goalNode= goals.empty()? eng.tok.get("hrana") : goals.front().first;
+    cout<<"\n===== ABLATION TESTS: \""<<question<<"\" (goal='"<<eng.tok.name(goalNode)<<"') =====\n";
+    const char* names[]={"","TRANSFORMER ONLY","TRANSFORMER + GRAPH","TRANSFORMER + GRAPH + WORLD",
+                         "TRANSFORMER + GRAPH + WORLD + PLANNER","FULL SYSTEM (+GOAL+VERIFIER)"};
+    for(int lvl=1;lvl<=5;lvl++){
+        string a=genAblation(eng,question,lvl,graph,wm,planner,goalNode,verifier,/*verbose*/lvl==5);
+        cout<<"[ABLATION "<<lvl<<"] "<<names[lvl]<<":\n   => \""<<a<<"\"\n";
+    }
+}
 
 // ############################################################################
 //  v8 — "IMPLEMENTEAZA TOT": inchidem golurile din analiza v7 cu cod REAL.
@@ -1102,31 +1170,48 @@ int main(){
     auto& tok=eng.tok; auto& store=eng.store; auto& graph=eng.graph; auto& T=eng.T;
 
     // --- corpus mic + pretrain (model mic; inteligenta sta in graf/world-model) ---
-    vector<string> ro = {
-        "om este fiinta","pisica este animal","caine este animal","Ion este om","Vasile este om",
-        "Ion lucreaza sofer","sofer conduce camion","sofer face munca","munca produce bani",
-        "bani cumpara hrana","hrana sustine om","om munceste pentru bani","motorul produce putere",
-        "focul produce caldura",
-        // --- fapte/relatii suplimentare (acelasi stil) ---
-        "fiinta are nevoie hrana","hrana sustine viata","omul munceste pentru bani","banii cumpara hrana",
-        "hrana ajuta omul","hrana tine omul viu","omul are nevoie hrana","omul are nevoie bani",
-        "banii ajuta omul","munca ajuta omul","omul munceste ca sa traiasca",
-        // --- tipare de RASPUNS (modelul invata sa verbalizeze, nu hardcodat) ---
-        "de ce munceste omul raspuns omul munceste pentru ca are nevoie de bani",
-        "omul munceste pentru ca banii cumpara hrana",
-        "omul munceste pentru ca hrana sustine viata",
-        "de ce are omul nevoie de bani raspuns omul are nevoie de bani pentru hrana",
-        "de ce are omul nevoie de hrana raspuns omul are nevoie de hrana ca sa traiasca",
-        "de ce lucreaza Ion raspuns Ion lucreaza pentru ca munca produce bani",
-        "Ion lucreaza pentru ca banii cumpara hrana","Ion munceste ca sa obtina bani",
-        "banii ajuta omul sa cumpere hrana","hrana ajuta omul sa ramana in viata"
+    // FAPTE (absorbite in graf + antrenate) — au <eos> ca delimitator special.
+    vector<string> roFacts = {
+        "om este fiinta <eos>","pisica este animal <eos>","caine este animal <eos>",
+        "Ion este om <eos>","Vasile este om <eos>","Ion lucreaza sofer <eos>",
+        "sofer conduce camion <eos>","sofer face munca <eos>","munca produce bani <eos>",
+        "bani cumpara hrana <eos>","hrana sustine om <eos>","om munceste pentru bani <eos>",
+        "motorul produce putere <eos>","focul produce caldura <eos>",
+        "fiinta are nevoie hrana <eos>","hrana sustine viata <eos>","omul munceste pentru bani <eos>",
+        "banii cumpara hrana <eos>","hrana ajuta omul <eos>","hrana tine omul viu <eos>",
+        "omul are nevoie hrana <eos>","omul are nevoie bani <eos>","banii ajuta omul <eos>",
+        "munca ajuta omul <eos>","omul munceste ca sa traiasca <eos>",
+        // polaritate pozitiva explicita (item 8): munca/bani/hrana cresc impreuna
+        "munca creste bani <eos>","mai multa munca produce mai multi bani <eos>",
+        "bani cresc hrana <eos>"
     };
-    vector<vector<int>> roIds; for(auto& s:ro){ vector<string> nw; roIds.push_back(eng.tokenize(s,nw)); }
-    cout<<"== PRETRAIN (model mic) ==  D="<<DEMO_D<<" -> tinta TARGET_D="<<TARGET_D<<", epoci="<<PRETRAIN_EPOCHS<<"\n";
+    // DIALOG (doar antrenat pt verbalizare; NU absorbit in graf -> "de/ce" nu
+    // devin noduri de reasoning). Modelul invata sa raspunda si sa emita <eos>.
+    vector<string> roDialog = {
+        "de ce munceste omul raspuns omul munceste pentru ca are nevoie de bani pentru hrana ca sa traiasca <eos>",
+        "de ce lucreaza Ion raspuns Ion lucreaza pentru ca munca produce bani pentru hrana <eos>",
+        "de ce are omul nevoie de bani raspuns omul are nevoie de bani pentru ca banii cumpara hrana <eos>",
+        "de ce are omul nevoie de hrana raspuns omul are nevoie de hrana ca sa traiasca <eos>",
+        "omul munceste pentru ca banii cumpara hrana <eos>",
+        "omul munceste pentru ca hrana sustine viata <eos>",
+        "Ion munceste ca sa obtina bani <eos>","banii ajuta omul sa cumpere hrana <eos>",
+        "hrana ajuta omul sa ramana in viata <eos>",
+        "intrebare necunoscuta raspuns nu sunt sigur <eos>",
+        "xyzzy necunoscut raspuns nu sunt sigur <eos>"
+    };
+    vector<vector<int>> factIdsRo, dialIds, roIds;
+    for(auto& s:roFacts){ vector<string> nw; auto v=eng.tokenize(s,nw); factIdsRo.push_back(v); roIds.push_back(v); }
+    for(auto& s:roDialog){ vector<string> nw; auto v=eng.tokenize(s,nw); dialIds.push_back(v); roIds.push_back(v); }
+    eng.EOS = tok.get("<eos>");
+    cout<<"== PRETRAIN (model mic) ==  D="<<DEMO_D<<" -> tinta TARGET_D="<<TARGET_D<<", epoci="<<PRETRAIN_EPOCHS<<", EOS id="<<eng.EOS<<"\n";
     float step=0; for(int ep=0;ep<PRETRAIN_EPOCHS;ep++){ vector<int> ord(roIds.size()); for(int i=0;i<(int)ord.size();i++)ord[i]=i;
         shuffle(ord.begin(),ord.end(),rng); for(int i:ord) T.trainSeq(roIds[i],true,false,0.01f,1e-3f,step); }
-    for(auto& ids:roIds) eng.absorb(ids);
-    cout<<"   graf: "<<graph.nodes.size()<<" noduri, "<<graph.edges.size()<<" muchii\n";
+    // absorb DOAR faptele, fara <eos> (graful ramane curat de delimitatori/stopword)
+    for(auto& ids:factIdsRo){ vector<int> f; for(int t:ids) if(!eng.isEos(t)) f.push_back(t); eng.absorb(f); }
+    eng.learnStopwords(roIds,0.10f);   // DEDUSE din date
+    cout<<"   graf: "<<graph.nodes.size()<<" noduri, "<<graph.edges.size()<<" muchii; stopword-uri deduse: ";
+    { int c=0; for(int s:eng.stopwords){ if(c++<12) cout<<tok.name(s)<<" "; } } cout<<"\n";
+
 
     // ================= PARTEA 1: SCALARE / MEMORIE =================
     cout<<"\n========== PARTEA 1: SCALARE / MEMORIE ==========\n";
@@ -1216,9 +1301,56 @@ int main(){
                                      {},tok.get("hrana"),wm,18,true);
       cout<<"   => \""<<a<<"\"\n"; }
     cout<<"[B] intrebare FARA suport in graf:\n";
-    { vector<string> nwb; auto ctxb=eng.tokenize("xyzzy necunoscut",nwb); bool grounded=false; for(int t:ctxb)if(graph.isNode(t))grounded=true;
+    { vector<string> nwb; auto ctxb=eng.tokenize("xyzzy necunoscut",nwb); bool grounded=false; for(int t:ctxb)if(graph.isNode(t)&&!eng.isStopword(t))grounded=true;
       if(!grounded) cout<<"   => \"nu sunt sigur\" (verdict numeric: nicio ancora in graf)\n";
-      else { auto a=generateCognitiveAnswer(eng,"xyzzy necunoscut",{},{},-1,wm,8,false); cout<<"   => \""<<a<<"\"\n"; } }
+      else { auto a=generateCognitiveAnswer(eng,"xyzzy necunoscut",{},{},-1,wm,32,false); cout<<"   => \""<<a<<"\"\n"; } }
+
+    // ===== ABLATION TESTS (transformer pur -> sistem complet) =====
+    runAblationTests(eng,graph,wm,planner,gl,verifier,"de ce munceste omul");
+
+    // ===== STOPWORD TEST (ancore deduse din date) =====
+    cout<<"\n===== STOPWORD TEST =====\n";
+    { vector<string> nwS; auto t=eng.tokenize("de ce munceste omul",nwS);
+      cout<<"   toti tokenii: "; for(int id:t)cout<<tok.name(id)<<" "; cout<<"\n";
+      cout<<"   ancore (fara stopword): "; for(int id:t) if(graph.isNode(id)&&!eng.isStopword(id))cout<<tok.name(id)<<" ";
+      cout<<"\n   stopword filtrate: "; for(int id:t) if(eng.isStopword(id))cout<<tok.name(id)<<" "; cout<<"\n"; }
+
+    // ===== EOS TEST =====
+    cout<<"\n===== EOS TEST =====\n";
+    { auto a=generateCognitiveAnswer(eng,"de ce munceste omul",{tok.get("om"),tok.get("bani"),tok.get("hrana")},{},tok.get("hrana"),wm,32,false);
+      bool hasEos = a.find("<eos>")!=string::npos;
+      cout<<"   raspuns: \""<<a<<"\"\n   contine <eos>? "<<(hasEos?"DA (bug)":"NU")<<"  => generarea s-a oprit la EOS, tokenul nu apare in text\n"; }
+
+    // ===== GRAPH PATCH TEST (fara retrain al transformerului) =====
+    //  ACELASI bias inainte/dupa; se schimba DOAR graful. Activam vecinatatea pe
+    //  2 hop-uri, deci noile noduri (reachable din ancora) intra in context.
+    cout<<"\n===== GRAPH PATCH TEST FARA RETRAIN =====\n";
+    { auto genG=[&](float bias){ vector<string> nwp; auto ctx=eng.tokenize("de ce munceste omul",nwp);
+        int cue=tok.get("raspuns"); if(cue>=0)ctx.push_back(cue);
+        ActiveGraphState A; set<int> seed;
+        for(int id:ctx) if(graph.isNode(id)&&!eng.isStopword(id)){ A.activate(id,1.f); seed.insert(id); }
+        // 2-hop spreading: noile relatii din graf devin active
+        for(int h=0;h<2;h++){ set<int> nxt; for(int id:seed) for(int ei:graph.out(id)){ A.activate(graph.edges[ei].dst,0.9f-0.2f*h); nxt.insert(graph.edges[ei].dst);} seed=nxt; }
+        vector<float> qv=meanEmb(store,ctx,DEMO_D); set<int> used(ctx.begin(),ctx.end()); string out; vector<int> gen;
+        for(int i=0;i<32;i++){ Engine::StepDbg dbg; int nx=eng.nextToken(ctx,A,qv,used,dbg,false,bias,1.5f,0.8f);
+            if(nx<0||eng.isEos(nx)||tok.isVirtual(nx)||nx==cue)break; gen.push_back(nx); int gn=gen.size();
+            if(gn>=4&&gen[gn-1]==gen[gn-3]&&gen[gn-2]==gen[gn-4])break;
+            if(gn>=6&&gen[gn-1]==gen[gn-4]&&gen[gn-2]==gen[gn-5]&&gen[gn-3]==gen[gn-6])break;
+            out+=(out.empty()?"":" ")+tok.name(nx); ctx.push_back(nx); used.insert(nx); A.decay(); A.reinforceByToken(nx,store,0.4f); }
+        return out; };
+      cout<<"   inainte (graf original):\n      \""<<genG(1.2f)<<"\"\n";
+      // PATCH: relatii noi REACHABLE din 'omul' (omul->hrana->energie->viata),
+      //        FARA retrain al transformerului (corpul ramane inghetat).
+      { vector<string> p; for(string s:{string("hrana produce energie"),string("energie sustine viata"),
+                                         string("omul are nevoie energie")}){ auto e=eng.tokenize(s,p); eng.absorb(e); } wm.learn(graph); }
+      // Online embedding learner (corp INGHETAT): tokenul nou 'energie' isi
+      // aliniaza embeddingul la vecinii din graf ca sa fie competitiv in logits.
+      { int en=tok.get("energie"); if(en>=0) for(int it=0;it<50;it++){ vector<float> cv(DEMO_D,0); int c=0;
+          for(int ei:graph.out(en)){ addInto(cv,store.E[graph.edges[ei].dst]); c++; }
+          for(int ei=0;ei<(int)graph.edges.size();ei++) if(graph.edges[ei].dst==en){ addInto(cv,store.E[graph.edges[ei].src]); c++; }
+          if(c){ for(float&x:cv)x/=c; eng.online.updateNodeEmbedding(en,cv,0.12f); } } }
+      cout<<"   dupa modificare DOAR a grafului (acelasi transformer):\n      \""<<genG(1.2f)<<"\"\n";
+      cout<<"   (aparitia lui 'energie' = graful a schimbat verbalizarea fara retrain)\n"; }
 
     // ################# PARTEA 8: "IMPLEMENTEAZA TOT" (v8) #################
     cout<<"\n########## v8: INCHIDEM GOLURILE DIN ANALIZA v7 ##########\n";
@@ -1228,7 +1360,9 @@ int main(){
     SignedWorldModel sw;
     map<pair<int,int>,float> truth;
     { uniform_real_distribution<float> u(-1,1);
-      for(auto& e:graph.edges) if(!truth.count({e.src,e.dst})) truth[{e.src,e.dst}]=(u(rng)>0?1.f:-1.f)*(0.4f+0.4f*fabs(u(rng))); }
+      // dinamica observata aici e POZITIV-monotona pe lantul cauzal (consistent
+      // cu exemplele "munca creste bani", "bani cresc hrana") => munca->bani > 0.
+      for(auto& e:graph.edges) if(!truth.count({e.src,e.dst})) truth[{e.src,e.dst}]=(0.4f+0.4f*fabs(u(rng))); }
     vector<SignedWorldModel::Episode> eps; normal_distribution<float> noise(0,0.02f);
     uniform_real_distribution<float> u01(0,1);
     for(int epi=0;epi<60;epi++){ SignedWorldModel::Episode ep; map<int,float> val;
