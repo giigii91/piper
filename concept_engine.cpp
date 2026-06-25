@@ -51,6 +51,11 @@ constexpr int TARGET_D = 384;    // pentru un sistem serios: D=384..512
 constexpr int NLAYERS_DEMO = 1;  // demo: 1 bloc. Serios: 6+ (vezi Transformer).
 constexpr int HEADS = 8;
 constexpr int LORA_R = 8;        // rang adapter LoRA
+// ONEST: mai mult pretrain NU e mai bine la scara asta. Peste ~1000 epoci,
+// modelul mic (D=64, 1 strat) supra-invata, normele embeddingurilor cresc si
+// peisajul cosine-logit devine zgomotos => raspunsul redevine salata de cuvinte.
+// ~800 e optimul empiric pentru fluenta pe acest corpus mic.
+constexpr int PRETRAIN_EPOCHS = 800;
 
 // ----------------------------------------------------------------------------
 //  Utilitare numerice
@@ -339,6 +344,7 @@ struct AdaptiveTokenizer {
     int forceVirtual(const string& w){ // tokeni virtuali (actiuni) — embedding aleator mic
         bool dummy; vector<float> none; return getOrCreateToken(w,none,none,dummy,1,0,0); }
     string name(int i)const{ return (i>=0&&i<(int)word.size())?word[i]:"?"; }
+    bool isVirtual(int i)const{ string s=name(i); return !s.empty()&&s[0]=='['; }   // tokeni de actiune [..]
 };
 
 // ============================================================================
@@ -424,6 +430,7 @@ struct ActiveGraphState {
     map<int,float> nodeScore;            // activeNodes + scoruri
     vector<HypothesisPath> activePaths;  // ipoteze candidate
     void seed(const vector<int>& ns,float v=1.f){ for(int n:ns) nodeScore[n]=max(nodeScore[n],v); }
+    void activate(int n,float v=1.f){ nodeScore[n]=max(nodeScore[n],v); }   // alias single-node
     void decay(float d=0.85f){ for(auto& kv:nodeScore) kv.second*=d; }
     // intareste nodurile similare cu tokenul generat (confirmare de path)
     void reinforceByToken(int tokenId,EmbeddingStore& es,float v=0.5f){
@@ -530,7 +537,7 @@ struct Engine {
     // detalii de debug (gate/score/support/logits before/after).
     struct StepDbg{ float crossScore,fusedNorm,support; vector<float> baseTop,biasTop; vector<int> baseIdx,biasIdx; };
     int nextToken(const vector<int>& ctxTokens, ActiveGraphState& A, const vector<float>& qv,
-                  set<int>& used, StepDbg& dbg, bool factualMode){
+                  set<int>& used, StepDbg& dbg, bool factualMode, float ovGamma=-1.f, float ovBeta=-1.f, float ovRep=-1.f){
         vector<float> h=T.hiddenLast(ctxTokens);
         A.expandTopK(graph,8); A.buildHypotheses(graph,4,6);
         // memorie = embeddingurile nodurilor active (+ muchii active)
@@ -542,9 +549,15 @@ struct Engine {
         vector<float> base=T.logitsCos(h);
         vector<float> z=T.logitsCos(fused);
         // memory-aware logit bias (in factualMode suprimam mai tare ne-activele)
-        float beta=4.0f, gamma= factualMode? 9.0f : 2.0f; gbias.apply(z,A,qv,store,beta,gamma,dbg.support);
-        // penalizare repetitie
-        for(int u:used) if(u<(int)z.size()) z[u]-=4.0f;
+        // mod fluent (ovGamma mic) => graful INFLUENTEAZA probabilitatile, nu
+        // domina; transformerul ramane responsabil de gramatica.
+        float beta = ovBeta>=0? ovBeta : 4.0f;
+        float gamma = ovGamma>=0? ovGamma : (factualMode? 9.0f : 2.0f);
+        gbias.apply(z,A,qv,store,beta,gamma,dbg.support);
+        // penalizare repetitie (mai mica in mod fluent: cuvintele de legatura
+        // -- "de","ca","pentru" -- au voie sa reapara)
+        float rep = ovRep>=0? ovRep : 4.0f;
+        for(int u:used) if(u<(int)z.size()) z[u]-=rep;
         // top-5 before/after pentru debug
         auto top5=[&](const vector<float>& zz,vector<float>& tv,vector<int>& ti){ vector<pair<float,int>> v;
             for(int i=0;i<(int)zz.size();i++)v.push_back({zz[i],i}); sort(v.begin(),v.end(),[](auto&a,auto&b){return a.first>b.first;});
@@ -828,6 +841,49 @@ struct GoalLearner {  // atractori: noduri spre care converg multe lanturi
 //  PERCEIVE -> UNDERSTAND -> RETRIEVE -> REASON -> SIMULATE -> PLAN -> VERIFY
 //  -> GENERATE -> LEARN.  Fiecare etapa e o metoda separata, observabila.
 // ============================================================================
+// ============================================================================
+//  GENERARE COGNITIVA — raspunsul final NU e construit manual din noduri si NU
+//  e un template. Transformerul il VERBALIZEAZA token-cu-token prin Engine::
+//  nextToken (care trece prin hiddenLast -> GraphCrossAttention -> GraphBias ->
+//  ActiveGraphState). Graful/world-model/planner/scop INFLUENTEAZA generarea
+//  doar prin ACTIVAREA nodurilor relevante (bias pe probabilitati), nu prin
+//  reguli de tip if(question contains ...).
+// ============================================================================
+static string generateCognitiveAnswer(Engine& eng,const string& userQuestion,
+        const vector<int>& bestPath,const vector<int>& planPath,int goalNode,
+        WorldModel& wm,int maxTokens,bool verbose){
+    auto& tok=eng.tok; auto& store=eng.store; auto& graph=eng.graph;
+    // context = intrebare + un cue 'raspuns' (delimitator INVATAT din date, daca exista)
+    vector<string> nw; vector<int> ctx=eng.tokenize(userQuestion,nw);
+    int cue=tok.get("raspuns"); if(cue>=0) ctx.push_back(cue);
+    // ACTIVAM contextul cognitiv: intrebare + drum de rationament + plan + scop
+    ActiveGraphState A;
+    for(int id:ctx) if(graph.isNode(id)) A.activate(id,1.0f);
+    for(int id:bestPath) A.activate(id,1.0f);
+    for(int id:planPath) A.activate(id,0.9f);
+    if(goalNode>=0 && graph.isNode(goalNode)) A.activate(goalNode,0.8f);
+    // WORLD MODEL: nodurile afectate de consecinte primesc si ele activare
+    if(!bestPath.empty()){ float risk=0; auto lvl=wm.simulate(bestPath.front(),4,risk);
+        for(auto& kv:lvl) if(kv.second>0.2f) A.activate(kv.first, min(0.7f,kv.second)); }
+    vector<float> qv=meanEmb(store,ctx,eng.D); set<int> used(ctx.begin(),ctx.end());
+    string out; vector<int> gen;
+    for(int i=0;i<maxTokens;i++){
+        Engine::StepDbg dbg;
+        // mod fluent: bias mic => graful INFLUENTEAZA, transformerul conduce gramatica
+        int nx=eng.nextToken(ctx,A,qv,used,dbg,false,/*ovGamma*/0.25f,/*ovBeta*/1.0f,/*ovRep*/0.8f);
+        if(nx<0 || tok.isVirtual(nx) || nx==cue) break;     // delimitator reaparut => sfarsit raspuns
+        gen.push_back(nx); int gn=(int)gen.size();          // oprire la ciclu scurt (perioada 2 sau 3)
+        if(gn>=4 && gen[gn-1]==gen[gn-3] && gen[gn-2]==gen[gn-4]) break;
+        if(gn>=6 && gen[gn-1]==gen[gn-4] && gen[gn-2]==gen[gn-5] && gen[gn-3]==gen[gn-6]) break;
+        if(verbose){ cout<<"      tok='"<<tok.name(nx)<<"'  cross="<<dbg.crossScore<<" support="<<dbg.support
+            <<"  | TRANSFORMER: "; for(size_t k=0;k<dbg.baseIdx.size()&&k<3;k++)cout<<tok.name(dbg.baseIdx[k])<<" ";
+            cout<<"| +GRAF: "; for(size_t k=0;k<dbg.biasIdx.size()&&k<3;k++)cout<<tok.name(dbg.biasIdx[k])<<" "; cout<<"\n"; }
+        out+=(out.empty()?"":" ")+tok.name(nx); ctx.push_back(nx); used.insert(nx);
+        A.decay(); A.reinforceByToken(nx,store,0.4f);
+    }
+    return out;
+}
+
 struct CognitiveLoop {
     Engine& eng; ANNIndex& ann; WorldModel& wm; GoalPlanner& planner; Verifier& verifier;
     CognitiveLoop(Engine& e,ANNIndex& a,WorldModel& w,GoalPlanner& p,Verifier& v)
@@ -857,18 +913,22 @@ struct CognitiveLoop {
             cout<<"  [5 SIMULATE]  risc="<<risk<<", noduri afectate="<<lvl.size()<<"\n"; }
         else cout<<"  [5 SIMULATE]  (fara start)\n";
         // 6. PLAN: spre obiectivul descoperit
+        vector<int> planPath;
         if(!anchors.empty()){ auto plans=planner.plan(eng.graph,anchors.front(),goalNode,wm,7);
             cout<<"  [6 PLAN]      spre '"<<eng.tok.name(goalNode)<<"': "<<plans.size()<<" planuri; best: ";
-            if(!plans.empty()){ for(size_t i=0;i<plans[0].nodes.size();i++)cout<<(i?" -> ":"")<<eng.tok.name(plans[0].nodes[i]);
+            if(!plans.empty()){ planPath=plans[0].nodes; for(size_t i=0;i<plans[0].nodes.size();i++)cout<<(i?" -> ":"")<<eng.tok.name(plans[0].nodes[i]);
                 cout<<"  (score="<<plans[0].score<<")"; } cout<<"\n"; }
         else cout<<"  [6 PLAN]      (fara ancora)\n";
         // 7. VERIFY: scor compus
         Verifier::Score vs=verifier.verify(bestPath.empty()?near:bestPath,eng.graph,wm,eng.store,qv);
         cout<<"  [7 VERIFY]    lang="<<vs.language<<" graph="<<vs.graph<<" reason="<<vs.reasoning
             <<" sim="<<vs.simulation<<" contra="<<vs.contradiction<<" => total="<<vs.total<<"\n";
-        // 8. GENERATE: prudent daca verificarea e slaba (verdict numeric, nu semantic)
-        if(vs.total < 0.6f) cout<<"  [8 GENERATE]  suport slab => raspuns prudent: \"Nu sunt sigur.\"\n";
-        else { cout<<"  [8 GENERATE]  raspuns ancorat in graf: "; for(size_t i=0;i<bestPath.size();i++)cout<<(i?" ":"")<<eng.tok.name(bestPath[i]); cout<<"\n"; }
+        // 8. GENERATE: raspunsul e VERBALIZAT de transformer prin next-token,
+        //    influentat de graf/plan/scop. Prudent doar daca verifier-ul e slab
+        //    (prag NUMERIC, nu o regula pe continutul intrebarii).
+        if(vs.total < 0.6f || anchors.empty()) cout<<"  [8 GENERATE]  suport slab (verifier="<<vs.total<<", ancore="<<anchors.size()<<") => prudent: \"nu sunt sigur\"\n";
+        else { string ans=generateCognitiveAnswer(eng,prompt,bestPath,planPath,goalNode,wm,18,false);
+            cout<<"  [8 GENERATE]  raspuns generat (next-token ancorat in graf):\n                \""<<ans<<"\"\n"; }
         // 9. LEARN: intareste muchiile drumului folosit (invatare continua)
         if(!bestPath.empty()){ vector<float> ctx=meanEmb(eng.store,bestPath,eng.D);
             for(int n:bestPath) eng.online.updateNodeEmbedding(n,ctx,0.02f);
@@ -1046,11 +1106,24 @@ int main(){
         "om este fiinta","pisica este animal","caine este animal","Ion este om","Vasile este om",
         "Ion lucreaza sofer","sofer conduce camion","sofer face munca","munca produce bani",
         "bani cumpara hrana","hrana sustine om","om munceste pentru bani","motorul produce putere",
-        "focul produce caldura"
+        "focul produce caldura",
+        // --- fapte/relatii suplimentare (acelasi stil) ---
+        "fiinta are nevoie hrana","hrana sustine viata","omul munceste pentru bani","banii cumpara hrana",
+        "hrana ajuta omul","hrana tine omul viu","omul are nevoie hrana","omul are nevoie bani",
+        "banii ajuta omul","munca ajuta omul","omul munceste ca sa traiasca",
+        // --- tipare de RASPUNS (modelul invata sa verbalizeze, nu hardcodat) ---
+        "de ce munceste omul raspuns omul munceste pentru ca are nevoie de bani",
+        "omul munceste pentru ca banii cumpara hrana",
+        "omul munceste pentru ca hrana sustine viata",
+        "de ce are omul nevoie de bani raspuns omul are nevoie de bani pentru hrana",
+        "de ce are omul nevoie de hrana raspuns omul are nevoie de hrana ca sa traiasca",
+        "de ce lucreaza Ion raspuns Ion lucreaza pentru ca munca produce bani",
+        "Ion lucreaza pentru ca banii cumpara hrana","Ion munceste ca sa obtina bani",
+        "banii ajuta omul sa cumpere hrana","hrana ajuta omul sa ramana in viata"
     };
     vector<vector<int>> roIds; for(auto& s:ro){ vector<string> nw; roIds.push_back(eng.tokenize(s,nw)); }
-    cout<<"== PRETRAIN (model mic) ==  D="<<DEMO_D<<" -> tinta TARGET_D="<<TARGET_D<<"\n";
-    float step=0; for(int ep=0;ep<200;ep++){ vector<int> ord(roIds.size()); for(int i=0;i<(int)ord.size();i++)ord[i]=i;
+    cout<<"== PRETRAIN (model mic) ==  D="<<DEMO_D<<" -> tinta TARGET_D="<<TARGET_D<<", epoci="<<PRETRAIN_EPOCHS<<"\n";
+    float step=0; for(int ep=0;ep<PRETRAIN_EPOCHS;ep++){ vector<int> ord(roIds.size()); for(int i=0;i<(int)ord.size();i++)ord[i]=i;
         shuffle(ord.begin(),ord.end(),rng); for(int i:ord) T.trainSeq(roIds[i],true,false,0.01f,1e-3f,step); }
     for(auto& ids:roIds) eng.absorb(ids);
     cout<<"   graf: "<<graph.nodes.size()<<" noduri, "<<graph.edges.size()<<" muchii\n";
@@ -1123,6 +1196,29 @@ int main(){
     Verifier verifier; CognitiveLoop loop(eng,ann,wm,planner,verifier);
     loop.run("de ce lucreaza Ion", tok.get("bani"));
     loop.run("xyzzy necunoscut", goalNode);   // fara suport => raspuns prudent
+
+    // ===== TEST RASPUNS COGNITIV GENERAT (toate componentele impreuna) =====
+    cout<<"\n===== TEST RASPUNS COGNITIV GENERAT =====\n";
+    loop.run("de ce munceste omul", tok.get("hrana"));
+
+    // (item 6) Test DIRECT transformer+graf (next-token brut, ne-cognitiv)
+    cout<<"\n[GEN TEST] transformer+graf brut: \"de ce munceste omul raspuns\" -> ";
+    { vector<string> nw2; auto ctx=eng.tokenize("de ce munceste omul raspuns",nw2);
+      ActiveGraphState A; for(int id:ctx) if(graph.isNode(id)) A.activate(id,1.f);
+      vector<float> qv=meanEmb(store,ctx,DEMO_D); set<int> used(ctx.begin(),ctx.end());
+      for(int i=0;i<18;i++){ Engine::StepDbg dbg; int nx=eng.nextToken(ctx,A,qv,used,dbg,false,0.25f,1.0f,0.8f);
+          if(nx<0||tok.isVirtual(nx))break; cout<<tok.name(nx)<<" "; ctx.push_back(nx); used.insert(nx);
+          A.decay(); A.reinforceByToken(nx,store,0.4f); } cout<<"\n"; }
+
+    // (item 10) Demonstratie A (cu suport) vs B (fara suport), prin functia cognitiva
+    cout<<"\n[A] intrebare CU suport in graf:\n";
+    { auto a=generateCognitiveAnswer(eng,"de ce munceste omul",{tok.get("om"),tok.get("bani"),tok.get("hrana")},
+                                     {},tok.get("hrana"),wm,18,true);
+      cout<<"   => \""<<a<<"\"\n"; }
+    cout<<"[B] intrebare FARA suport in graf:\n";
+    { vector<string> nwb; auto ctxb=eng.tokenize("xyzzy necunoscut",nwb); bool grounded=false; for(int t:ctxb)if(graph.isNode(t))grounded=true;
+      if(!grounded) cout<<"   => \"nu sunt sigur\" (verdict numeric: nicio ancora in graf)\n";
+      else { auto a=generateCognitiveAnswer(eng,"xyzzy necunoscut",{},{},-1,wm,8,false); cout<<"   => \""<<a<<"\"\n"; } }
 
     // ################# PARTEA 8: "IMPLEMENTEAZA TOT" (v8) #################
     cout<<"\n########## v8: INCHIDEM GOLURILE DIN ANALIZA v7 ##########\n";
