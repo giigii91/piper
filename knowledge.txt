@@ -1,0 +1,31 @@
+# Fapte — invatate PRIN CITIRE. Sistemul descopera singur relatiile (ca
+# clustere numerice R0,R1..) si conceptele (clustere de noduri), fara ca
+# vreun nume semantic sa apara in cod.
+# Conventie pur structurala (nu semantica): primul token = sursa, ultimul =
+# tinta, restul = suprafata-relatie (din care se calculeaza embedding-ul).
+
+Ion este om
+Maria este om
+Vasile este om
+pisica este animal
+caine este animal
+sofer este meserie
+mecanic este meserie
+meserie este ocupatie
+
+munca produce bani
+focul produce caldura
+motorul produce putere
+meserie produce bani
+
+Ion lucreaza sofer
+Vasile lucreaza mecanic
+
+bani cumpara hrana
+hrana sustine om
+
+om munceste pentru bani
+om mananca pentru energie
+
+om inseamna fiinta vie
+animal inseamna fiinta vie

@@ -1,0 +1,8 @@
+# Intrebari — transformate in embedding si cautate in graf prin path-search
+# ponderat. Nicio regula de tip "if incepe cu 'de ce'". Daca nu exista path
+# cu scor suficient => "Nu stiu".
+
+de ce lucreaza Ion
+ce este Ion
+de ce munceste om
+de ce zboara dragonul
